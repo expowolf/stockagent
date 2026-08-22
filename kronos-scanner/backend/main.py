@@ -1,11 +1,13 @@
 # main.py
 """FastAPI application exposing the Kronos quant engines and a daily scan."""
 
+import os
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
+import anthropic
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -18,6 +20,9 @@ from models import (
     make_engine,
     make_session_factory,
 )
+from notify import push
+
+_anthropic = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
 app = FastAPI(title="Kronos AI Stock Scanner", version="0.1.0")
 
@@ -183,6 +188,121 @@ def scan(
     # Rank by OU mean-reversion opportunity (descending).
     results.sort(key=lambda s: s.ou_score, reverse=True)
     return results
+
+
+def _claude_analysis(ticker: str, alert_msg: str, sig: SignalResponse) -> str:
+    """
+    Ask Claude to interpret a TradingView alert in the context of Kronos signals.
+    Returns a concise analysis string suitable for a push notification.
+    """
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return f"{ticker} alert received. OU={sig.ou_score:.1f} | Regime={sig.hmm_regime} | VaR={sig.evt_var_99*100:.2f}%" if sig.evt_var_99 else f"{ticker} alert. OU={sig.ou_score:.1f} | Regime={sig.hmm_regime}"
+
+    prompt = f"""TradingView fired an alert for {ticker}: "{alert_msg}"
+
+Kronos quant signals as of {sig.date.strftime('%Y-%m-%d')}:
+- Current price: ${sig.current_price:.2f}
+- OU mean-reversion score: {sig.ou_score:.1f}/100 (half-life {sig.ou_halflife:.1f}d)
+- HMM regime: {sig.hmm_regime} (confidence {sig.hmm_confidence:.0%})
+- Kalman alpha (drift): {sig.kalman_alpha:+.4f}
+- 99% VaR: {f'{sig.evt_var_99*100:.2f}%' if sig.evt_var_99 else 'n/a'}
+
+In 2-3 sentences: what does this alert mean given these signals? Is this a high-conviction setup or noise? Be direct, no disclaimers."""
+
+    try:
+        msg = _anthropic.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text.strip()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[claude] analysis failed: {exc}")
+        return f"{ticker} alert: {alert_msg}"
+
+
+@app.post("/webhook/tradingview")
+async def tradingview_webhook(request: Request):
+    """
+    Receive a TradingView alert, run Kronos engines, ask Claude for context,
+    then push a notification to your phone via ntfy.sh.
+
+    TradingView alert message body (set this in your TV alert):
+    {
+      "ticker": "{{ticker}}",
+      "price": {{close}},
+      "volume": {{volume}},
+      "message": "{{strategy.order.comment}}"
+    }
+
+    Required env vars:  NTFY_TOPIC, ANTHROPIC_API_KEY
+    """
+    try:
+        body: Dict[str, Any] = await request.json()
+    except Exception:
+        # TradingView can send plain-text alerts too.
+        body = {"message": (await request.body()).decode()}
+
+    ticker = str(body.get("ticker", body.get("symbol", "UNKNOWN"))).upper().strip()
+    price = body.get("price") or body.get("close")
+    alert_msg = str(body.get("message", body.get("alert", "Alert fired")))
+
+    # Run Kronos engines on the alerted ticker.
+    sig: Optional[SignalResponse] = None
+    try:
+        df = load_ticker(ticker, period="2y")
+        if not df.empty:
+            sig = compute_signals(ticker, df)
+            persist_signals(sig)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[webhook] signal computation failed for {ticker}: {exc}")
+
+    if sig is None:
+        # Can't enrich — send a bare alert.
+        push(
+            title=f"Kronos Alert: {ticker}",
+            message=f"{alert_msg}\nPrice: {price or 'n/a'}\n(No Kronos data available)",
+            priority="high",
+            tags=["chart_increasing", "bell"],
+        )
+        return {"status": "sent", "ticker": ticker, "enriched": False}
+
+    # Ask Claude for a quick interpretation.
+    analysis = _claude_analysis(ticker, alert_msg, sig)
+
+    # Decide notification priority from signal strength.
+    if sig.ou_score > 75:
+        priority = "urgent"
+        tags = ["rotating_light", "chart_increasing"]
+    elif sig.ou_score > 55:
+        priority = "high"
+        tags = ["bell", "chart_increasing"]
+    else:
+        priority = "default"
+        tags = ["bell"]
+
+    push_body = (
+        f"{analysis}\n\n"
+        f"OU {sig.ou_score:.1f} | {sig.hmm_regime} | "
+        f"VaR {sig.evt_var_99*100:.2f}%" if sig.evt_var_99 else
+        f"{analysis}\n\nOU {sig.ou_score:.1f} | {sig.hmm_regime}"
+    )
+
+    push(
+        title=f"Kronos: {ticker} @ ${sig.current_price:.2f}",
+        message=push_body,
+        priority=priority,
+        tags=tags,
+    )
+
+    return {
+        "status": "sent",
+        "ticker": ticker,
+        "enriched": True,
+        "ou_score": sig.ou_score,
+        "regime": sig.hmm_regime,
+        "analysis_preview": analysis[:120],
+    }
 
 
 if __name__ == "__main__":
