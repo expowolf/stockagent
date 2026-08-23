@@ -66,6 +66,29 @@ For a continuous session, this composes with `/loop`:
 The CLI is already session-aware (07:30–11:00 MT, phase-tapered cadence) and
 credit-governed, so repeated invocations stay inside budget on their own.
 
+## Phone alerts
+
+New TAKEs push to the phone automatically when `NTFY_TOPIC` is set. Every
+alert carries its **stop loss** in both the title and body, plus position size
+under the 1% rule. Alerts are deduped, so `/loop` will not re-alert the same
+setup.
+
+If a TAKE appears but the summary says `notifications off`, tell the user once
+that `NTFY_TOPIC` is unset — don't repeat it every scan.
+
+## Risk gate
+
+Every TAKE is gated on risk discipline before it can reach the user, whatever
+the strategy says:
+
+- **no stop loss = never a TAKE** (hard block, non-negotiable)
+- stop must clear normal noise (>= 0.5x ATR)
+- R:R at or above the configured minimum
+- position sized off the stop, not off conviction
+
+When a name is blocked, the reason is prefixed `risk:` — report it as-is. Do
+not argue with the gate or suggest overriding it.
+
 ## Credit discipline
 
 The Python does the analysis for free — candlestick detection and the

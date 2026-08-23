@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Dict, List
 
@@ -45,10 +46,16 @@ def _signals(data: Dict[str, object]) -> dict:
 
 def _fmt(v: Verdict, wide: bool) -> str:
     line = f"{v.decision:<4} {v.ticker:<6} {v.price:>8.2f}  {v.confidence:>4.0%}"
-    if v.entry and v.invalidation:
-        line += f"  e{v.entry:.2f}/s{v.invalidation:.2f}"
+    if v.invalidation:
+        line += f"  STOP {v.invalidation:.2f}"
+        if v.stop_pct:
+            line += f"(-{v.stop_pct*100:.1f}%)"
         if v.target:
-            line += f"/t{v.target:.2f}"
+            line += f" tgt {v.target:.2f}"
+        if v.rr:
+            line += f" rr{v.rr:.1f}"
+        if v.shares:
+            line += f" {v.shares}sh"
     if wide or v.decision == "TAKE":
         line += f"  {v.reason[:58]}"
     return line
@@ -63,6 +70,9 @@ def main(argv=None) -> int:
     ap.add_argument("--budget", type=int, default=None, help="token budget for the window")
     ap.add_argument("--max-paid", type=int, default=3, help="paid calls per sweep")
     ap.add_argument("--ignore-session", action="store_true", help="scan even outside the window")
+    ap.add_argument("--notify", action="store_true", default=None,
+                    help="push new TAKEs to your phone (auto-on when NTFY_TOPIC is set)")
+    ap.add_argument("--no-notify", action="store_false", dest="notify")
     args = ap.parse_args(argv)
 
     session = session_from_env()
@@ -71,8 +81,6 @@ def main(argv=None) -> int:
     if args.tickers.strip():
         universe = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
     else:
-        import os
-
         from data.ingestion import DEFAULT_UNIVERSE
 
         raw = os.environ.get("KRONOS_UNIVERSE", ",".join(DEFAULT_UNIVERSE[:20]))
@@ -111,6 +119,23 @@ def main(argv=None) -> int:
     takes = [v for v in verdicts if v.decision == "TAKE"]
     snap = governor.snapshot()
 
+    # Push new TAKEs to the phone. Deduped, so re-running under /loop does not
+    # re-alert the same setup. Every alert carries its stop loss.
+    pushed = 0
+    want_notify = args.notify if args.notify is not None else bool(os.environ.get("NTFY_TOPIC"))
+    if want_notify:
+        from notify import push
+
+        for v in screener.new_takes(verdicts):
+            ok = push(
+                title=f"TAKE {v.ticker} ${v.price:.2f} · stop ${v.invalidation:.2f}"
+                if v.invalidation else f"TAKE {v.ticker} ${v.price:.2f}",
+                message=v.alert_text(),
+                priority="high",
+                tags=["chart_increasing"],
+            )
+            pushed += 1 if ok else 0
+
     if args.as_json:
         print(json.dumps({
             "ok": True,
@@ -139,7 +164,12 @@ def main(argv=None) -> int:
             print(f"\n+{len(verdicts) - len(takes)} SKIP")
 
     paid = sum(1 for v in verdicts if v.tier != "none")
-    print(f"\ncost: {paid} paid call(s), {snap['spent_tokens']:,} tokens used this window")
+    tail = f"\ncost: {paid} paid call(s), {snap['spent_tokens']:,} tokens used this window"
+    if want_notify:
+        tail += f" · {pushed} phone alert(s) sent"
+    elif takes:
+        tail += " · notifications off (set NTFY_TOPIC)"
+    print(tail)
     return 0
 
 

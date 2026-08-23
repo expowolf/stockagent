@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -24,6 +24,7 @@ import numpy as np
 
 from .budget import CreditGovernor, Tier, TIER_MODEL
 from .patterns import dedupe, detect, net_bias
+from .risk import RiskAssessment, RiskPolicy
 from .strategy import MarketContext, Strategy, StrategySignal, load_strategy
 
 try:
@@ -44,12 +45,35 @@ class Verdict:
     tier: str              # which tier produced this
     tokens: int = 0
     entry: Optional[float] = None
-    invalidation: Optional[float] = None
+    invalidation: Optional[float] = None   # the stop loss
     target: Optional[float] = None
+    # Risk-gate output
+    rr: Optional[float] = None
+    stop_pct: Optional[float] = None
+    shares: Optional[int] = None
+    risk_amount: Optional[float] = None
+    warnings: list = field(default_factory=list)
     at: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def alert_text(self) -> str:
+        """Notification body. The stop loss is the point of this message."""
+        lines = [f"{self.decision} {self.ticker} @ ${self.price:.2f}"]
+        if self.invalidation:
+            lines.append(f"STOP ${self.invalidation:.2f}")
+            if self.stop_pct:
+                lines[-1] += f"  (-{self.stop_pct*100:.1f}%)"
+        if self.target:
+            lines.append(f"target ${self.target:.2f}" + (f"  R:R {self.rr:.1f}" if self.rr else ""))
+        if self.shares:
+            lines.append(f"size {self.shares} sh  risk ${self.risk_amount:,.0f}")
+        if self.reason:
+            lines.append(self.reason)
+        for w in self.warnings or []:
+            lines.append(f"! {w}")
+        return "\n".join(lines)
 
 
 def _structure(df) -> dict:
@@ -133,9 +157,12 @@ class Screener:
         governor: Optional[CreditGovernor] = None,
         strategy: Optional[Strategy] = None,
         max_paid_per_scan: int = 3,
+        risk: Optional[RiskPolicy] = None,
     ) -> None:
         self.governor = governor or CreditGovernor()
         self.strategy = strategy or load_strategy()
+        # Risk discipline is applied to every TAKE, independent of strategy.
+        self.risk = risk or RiskPolicy.from_env()
         # Hard ceiling on paid calls per sweep. This bounds cost even if a
         # plugged-in strategy promotes far too many names — only the top-K by
         # conviction are paid for; the rest still get free-tier verdicts.
@@ -246,9 +273,35 @@ class Screener:
 
         return ctx, sig, None
 
+    def _apply_risk(self, v: Verdict, ctx: MarketContext, sig: StrategySignal) -> Verdict:
+        """
+        Gate every TAKE through risk discipline.
+
+        A TAKE that cannot be structured survivably is downgraded to SKIP. In
+        particular a signal with no stop loss can never become a TAKE, no
+        matter how confident the strategy or the model is about direction.
+        """
+        if v.decision != "TAKE":
+            return v
+
+        ra: RiskAssessment = self.risk.assess(sig, ctx)
+        v.warnings = list(ra.warnings or [])
+
+        if not ra.approved:
+            v.decision = "SKIP"
+            v.reason = f"risk: {ra.reason}"
+            v.confidence = 0.0
+            return v
+
+        v.rr = ra.rr
+        v.stop_pct = ra.stop_pct
+        v.shares = ra.shares
+        v.risk_amount = ra.risk_amount
+        return v
+
     def _free_verdict(self, ctx: MarketContext, sig: StrategySignal) -> Verdict:
         """Numeric-only verdict — used when budget is spent or a call fails."""
-        return Verdict(
+        return self._apply_risk(Verdict(
             ticker=ctx.ticker,
             decision="TAKE" if sig.conviction >= 0.6 else "SKIP",
             confidence=sig.conviction,
@@ -259,7 +312,7 @@ class Screener:
             invalidation=sig.invalidation,
             target=sig.target,
             at=self._now(),
-        )
+        ), ctx, sig)
 
     def _paid_verdict(self, ctx: MarketContext, sig: StrategySignal) -> Verdict:
         """Stage 3 — model call at whatever tier the governor permits."""
@@ -270,7 +323,7 @@ class Screener:
             result = self._ask_model(ctx, sig, tier)
             if result is not None:
                 decision, conf, reason, tokens = result
-                return Verdict(
+                return self._apply_risk(Verdict(
                     ticker=ctx.ticker,
                     decision=decision,
                     confidence=conf,
@@ -282,7 +335,7 @@ class Screener:
                     invalidation=sig.invalidation,
                     target=sig.target,
                     at=self._now(),
-                )
+                ), ctx, sig)
         return self._free_verdict(ctx, sig)
 
     def evaluate_one(self, ticker: str, df, signals=None) -> Verdict:
