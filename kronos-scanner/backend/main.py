@@ -305,6 +305,217 @@ async def tradingview_webhook(request: Request):
     }
 
 
+# --------------------------------------------------------------------------- #
+# Trading agent
+# --------------------------------------------------------------------------- #
+from fastapi.responses import HTMLResponse  # noqa: E402
+
+from agent import CreditGovernor, Screener  # noqa: E402
+from agent.runner import AgentRunner  # noqa: E402
+
+AGENT_UNIVERSE = [
+    t.strip().upper()
+    for t in os.environ.get("KRONOS_UNIVERSE", ",".join(DEFAULT_UNIVERSE[:20])).split(",")
+    if t.strip()
+]
+
+_governor = CreditGovernor(
+    token_budget=int(os.environ.get("KRONOS_TOKEN_BUDGET", "400000")),
+    window_hours=float(os.environ.get("KRONOS_WINDOW_HOURS", "5")),
+    reserve_pct=float(os.environ.get("KRONOS_RESERVE_PCT", "0.20")),
+)
+_screener = Screener(
+    governor=_governor,
+    max_paid_per_scan=int(os.environ.get("KRONOS_MAX_PAID_PER_SCAN", "3")),
+)
+
+
+def _agent_load(tickers):
+    return load_universe(tickers, period="1y")
+
+
+def _agent_signals(ticker, df):
+    return compute_signals(ticker, df)
+
+
+def _on_take(fresh):
+    """Push new TAKE verdicts to the phone."""
+    for v in fresh:
+        push(
+            title=f"TAKE {v.ticker} @ ${v.price:.2f}",
+            message=f"{v.reason}\nconfidence {v.confidence:.0%} · {v.tier} tier",
+            priority="high",
+            tags=["chart_increasing"],
+        )
+
+
+_agent = AgentRunner(
+    universe=AGENT_UNIVERSE,
+    load_fn=_agent_load,
+    signal_fn=_agent_signals,
+    governor=_governor,
+    screener=_screener,
+    on_take=_on_take,
+)
+
+
+@app.get("/agent/status")
+def agent_status():
+    """Runner + credit status. This is what the phone header shows."""
+    return _agent.status()
+
+
+@app.get("/agent/scan")
+def agent_scan():
+    """Run one sweep now and return every verdict."""
+    verdicts = _agent.scan_once()
+    return {
+        "scanned_at": _agent.last_scan_at,
+        "budget": _governor.snapshot(),
+        "verdicts": [v.to_dict() for v in verdicts],
+    }
+
+
+@app.get("/agent/verdicts")
+def agent_verdicts():
+    """Last sweep's results without re-running (costs nothing)."""
+    return {
+        "scanned_at": _agent.last_scan_at,
+        "budget": _governor.snapshot(),
+        "verdicts": [v.to_dict() for v in _agent.last_verdicts],
+    }
+
+
+@app.post("/agent/start")
+def agent_start(planned_cycles: int = 36):
+    started = _agent.start(planned_cycles=planned_cycles)
+    return {"started": started, "already_running": not started, **_agent.status()}
+
+
+@app.post("/agent/stop")
+def agent_stop():
+    return {"stopped": _agent.stop(), "running": _agent.is_running}
+
+
+@app.get("/agent/ui", response_class=HTMLResponse)
+def agent_ui():
+    """Self-contained mobile page. Add to home screen and it behaves like an app."""
+    return _AGENT_UI_HTML
+
+
+_AGENT_UI_HTML = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Kronos</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+body{background:#09090b;color:#e4e4e7;font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+     padding:16px 14px calc(28px + env(safe-area-inset-bottom));min-height:100vh}
+header{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:14px}
+h1{font-size:19px;letter-spacing:-.02em}
+h1 span{color:#22d3ee}
+.meta{font-size:11px;color:#71717a}
+.bar{height:6px;background:#27272a;border-radius:99px;overflow:hidden;margin:6px 0 4px}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,#22c55e,#eab308,#ef4444);
+       transition:width .4s}
+.budget{background:#18181b;border:1px solid #27272a;border-radius:12px;padding:11px 13px;margin-bottom:14px}
+.budget .row{display:flex;justify-content:space-between;font-size:11px;color:#a1a1aa}
+.pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:10px;font-weight:600;
+      text-transform:uppercase;letter-spacing:.04em}
+.on-pace{background:#052e16;color:#4ade80}.throttling{background:#422006;color:#fbbf24}
+.headroom{background:#082f49;color:#38bdf8}.exhausted-degraded-to-free{background:#450a0a;color:#f87171}
+.card{background:#18181b;border:1px solid #27272a;border-left-width:4px;border-radius:12px;
+      padding:13px 14px;margin-bottom:9px;display:flex;gap:12px;align-items:center}
+.card.take{border-left-color:#22c55e;background:#0b1f14}
+.card.skip{border-left-color:#3f3f46;opacity:.62}
+.tk{font-weight:700;font-size:16px;letter-spacing:-.01em;min-width:62px}
+.px{font-size:11px;color:#a1a1aa;font-variant-numeric:tabular-nums}
+.why{font-size:12px;color:#d4d4d8;margin-top:3px}
+.lv{font-size:10px;color:#71717a;margin-top:3px;font-variant-numeric:tabular-nums}
+.dec{margin-left:auto;text-align:right}
+.dec b{display:block;font-size:15px}
+.take .dec b{color:#4ade80}.skip .dec b{color:#71717a}
+.conf{font-size:10px;color:#71717a}
+button{width:100%;padding:13px;border:0;border-radius:11px;background:#22d3ee;color:#06373f;
+       font-weight:700;font-size:15px;margin-bottom:9px}
+button:disabled{opacity:.5}
+button.ghost{background:#27272a;color:#d4d4d8}
+.empty{text-align:center;color:#52525b;padding:34px 0;font-size:13px}
+</style></head><body>
+<header>
+  <h1>KRONOS <span>agent</span></h1>
+  <div class="meta" id="stamp">—</div>
+</header>
+
+<div class="budget">
+  <div class="row"><span>Credits</span><span id="bstat" class="pill">—</span></div>
+  <div class="bar"><i id="bfill" style="width:0%"></i></div>
+  <div class="row"><span id="btok">—</span><span id="bwin">—</span></div>
+</div>
+
+<button id="scan" onclick="scan()">Scan now</button>
+<button class="ghost" id="toggle" onclick="toggleLoop()">Start auto-scan</button>
+
+<div id="list"><div class="empty">No scan yet.</div></div>
+
+<script>
+let running=false;
+
+function fmt(n){return n>=1000?(n/1000).toFixed(1)+'k':n}
+
+function paint(d){
+  const b=d.budget||{};
+  document.getElementById('bfill').style.width=(b.percent_used||0)+'%';
+  const s=document.getElementById('bstat');
+  s.textContent=(b.status||'—').replace(/-/g,' ');
+  s.className='pill '+(b.status||'');
+  document.getElementById('btok')
+    .textContent=fmt(b.spent_tokens||0)+' / '+fmt(b.spendable_tokens||0)+' tokens';
+  document.getElementById('bwin')
+    .textContent='resets in '+(b.window_resets_in_minutes||0)+'m';
+  if(d.scanned_at)document.getElementById('stamp')
+    .textContent=new Date(d.scanned_at).toLocaleTimeString();
+
+  const v=d.verdicts||[];
+  const el=document.getElementById('list');
+  if(!v.length){el.innerHTML='<div class="empty">No verdicts.</div>';return}
+  el.innerHTML=v.map(x=>{
+    const t=x.decision==='TAKE';
+    const lv=(x.entry&&x.invalidation)
+      ?`<div class="lv">entry ${x.entry.toFixed(2)} · stop ${x.invalidation.toFixed(2)}`
+        +(x.target?` · target ${x.target.toFixed(2)}`:'')+`</div>`:'';
+    return `<div class="card ${t?'take':'skip'}">
+      <div><div class="tk">${x.ticker}</div><div class="px">$${x.price.toFixed(2)}</div></div>
+      <div style="flex:1"><div class="why">${x.reason||''}</div>${lv}</div>
+      <div class="dec"><b>${x.decision}</b>
+        <div class="conf">${Math.round((x.confidence||0)*100)}% · ${x.tier}</div></div>
+    </div>`}).join('');
+}
+
+async function load(){
+  try{paint(await (await fetch('/agent/verdicts')).json())}catch(e){}
+}
+async function scan(){
+  const b=document.getElementById('scan');
+  b.disabled=true;b.textContent='Scanning…';
+  try{paint(await (await fetch('/agent/scan')).json())}
+  catch(e){alert('Scan failed: '+e)}
+  b.disabled=false;b.textContent='Scan now';
+}
+async function toggleLoop(){
+  const t=document.getElementById('toggle');
+  await fetch(running?'/agent/stop':'/agent/start',{method:'POST'});
+  running=!running;
+  t.textContent=running?'Stop auto-scan':'Start auto-scan';
+}
+load();
+setInterval(load,30000);
+</script></body></html>"""
+
+
 if __name__ == "__main__":
     import uvicorn
 
