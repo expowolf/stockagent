@@ -47,6 +47,19 @@ Then stop. Add at most one short line if something genuinely needs flagging
 Do **not** add: a table of every SKIP, per-name reasoning, market outlook,
 disclaimers, or a summary of what the numbers "mean".
 
+## Data providers
+
+Tried in order, each skipped when unconfigured:
+
+| Provider | Free tier | Notes |
+|---|---|---|
+| **Alpaca** | real-time IEX, 200 req/min, 7yr history | **batches ~100 symbols/request** — best option |
+| yfinance | unlimited, no key | unofficial; breaks when Yahoo changes endpoints |
+| Alpha Vantage | 25 requests/**day** | short-list fallback only, quota-guarded |
+
+If the user asks about data health, run:
+`python -c "from data.ingestion import provider_status; print(provider_status())"`
+
 ## Exit codes
 
 - `0` — scanned fine

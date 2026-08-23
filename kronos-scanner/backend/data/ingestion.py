@@ -21,6 +21,24 @@ CACHE_DIR = os.environ.get(
 CACHE_TTL_HOURS = float(os.environ.get("KRONOS_CACHE_TTL_HOURS", "12"))
 
 
+_CHAIN = None
+
+
+def _chain():
+    """Lazily build the shared provider chain."""
+    global _CHAIN
+    if _CHAIN is None:
+        from .providers import ProviderChain
+
+        _CHAIN = ProviderChain()
+    return _CHAIN
+
+
+def provider_status() -> dict:
+    """Which providers are configured, and Alpha Vantage quota remaining."""
+    return _chain().status()
+
+
 def _cache_path(ticker: str) -> str:
     os.makedirs(CACHE_DIR, exist_ok=True)
     return os.path.join(CACHE_DIR, f"{ticker.upper()}.parquet")
@@ -92,17 +110,15 @@ def load_ticker(
     if use_cache and _cache_fresh(path):
         df = pd.read_parquet(path)
     else:
-        if yf is None:
-            raise RuntimeError("yfinance is not installed; cannot fetch live data.")
-        raw = yf.download(
-            ticker,
-            period=period,
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            threads=False,
-        )
-        df = _normalize(raw, ticker)
+        # Ordered provider chain: yfinance first, Alpha Vantage as a
+        # short-list fallback when yfinance is down.
+        from .providers import ProviderError
+
+        try:
+            df = _chain().fetch(ticker, period=period, interval="1d")
+        except ProviderError as exc:
+            raise RuntimeError(str(exc)) from exc
+
         if not df.empty and use_cache:
             df.to_parquet(path, index=False)
 
@@ -121,8 +137,43 @@ def load_universe(
     pause: float = 0.0,
 ) -> dict:
     """Load many tickers. Returns {ticker: DataFrame}. Failures are skipped."""
+    tickers = [str(t).upper() for t in tickers]
     out = {}
+
+    # Serve whatever is cached and fresh without touching the network.
+    need: list = []
     for t in tickers:
+        path = _cache_path(t)
+        if use_cache and _cache_fresh(path):
+            try:
+                out[t] = add_indicators(pd.read_parquet(path))
+                continue
+            except Exception:  # noqa: BLE001 - corrupt cache entry, refetch
+                pass
+        need.append(t)
+
+    # Batch-fetch the rest where the provider supports it (Alpaca does), which
+    # turns a 160-request sweep into about two.
+    if need:
+        try:
+            fetched = _chain().fetch_many(need, period=period)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ingestion] batch fetch failed, falling back per-ticker: {exc}")
+            fetched = {}
+
+        for t, df in fetched.items():
+            if df is None or df.empty:
+                continue
+            if use_cache:
+                try:
+                    df.to_parquet(_cache_path(t), index=False)
+                except Exception:  # noqa: BLE001
+                    pass
+            out[t] = add_indicators(df)
+
+        need = [t for t in need if t not in out]
+
+    for t in need:
         try:
             df = load_ticker(t, period=period, use_cache=use_cache)
             if not df.empty:
