@@ -39,9 +39,12 @@ def provider_status() -> dict:
     return _chain().status()
 
 
-def _cache_path(ticker: str) -> str:
+def _cache_path(ticker: str, interval: str = "1d") -> str:
     os.makedirs(CACHE_DIR, exist_ok=True)
-    return os.path.join(CACHE_DIR, f"{ticker.upper()}.parquet")
+    # Interval is part of the key: intraday bars must never be served from a
+    # daily cache entry, or a 1m scan silently gets yesterday's daily candles.
+    suffix = "" if interval == "1d" else f".{interval}"
+    return os.path.join(CACHE_DIR, f"{ticker.upper()}{suffix}.parquet")
 
 
 def _cache_fresh(path: str) -> bool:
@@ -98,6 +101,7 @@ def load_ticker(
     period: str = "2y",
     use_cache: bool = True,
     with_indicators: bool = True,
+    interval: str = "1d",
 ) -> pd.DataFrame:
     """
     Load a single ticker's daily OHLCV history.
@@ -105,7 +109,7 @@ def load_ticker(
     Returns a DataFrame with columns:
     [ticker, date, open, high, low, close, volume, sma_20, sma_50, rsi_14].
     """
-    path = _cache_path(ticker)
+    path = _cache_path(ticker, interval)
 
     if use_cache and _cache_fresh(path):
         df = pd.read_parquet(path)
@@ -115,7 +119,7 @@ def load_ticker(
         from .providers import ProviderError
 
         try:
-            df = _chain().fetch(ticker, period=period, interval="1d")
+            df = _chain().fetch(ticker, period=period, interval=interval)
         except ProviderError as exc:
             raise RuntimeError(str(exc)) from exc
 
@@ -135,6 +139,7 @@ def load_universe(
     period: str = "2y",
     use_cache: bool = True,
     pause: float = 0.0,
+    interval: str = "1d",
 ) -> dict:
     """Load many tickers. Returns {ticker: DataFrame}. Failures are skipped."""
     tickers = [str(t).upper() for t in tickers]
@@ -143,7 +148,7 @@ def load_universe(
     # Serve whatever is cached and fresh without touching the network.
     need: list = []
     for t in tickers:
-        path = _cache_path(t)
+        path = _cache_path(t, interval)
         if use_cache and _cache_fresh(path):
             try:
                 out[t] = add_indicators(pd.read_parquet(path))
@@ -156,7 +161,7 @@ def load_universe(
     # turns a 160-request sweep into about two.
     if need:
         try:
-            fetched = _chain().fetch_many(need, period=period)
+            fetched = _chain().fetch_many(need, period=period, interval=interval)
         except Exception as exc:  # noqa: BLE001
             print(f"[ingestion] batch fetch failed, falling back per-ticker: {exc}")
             fetched = {}
@@ -166,7 +171,7 @@ def load_universe(
                 continue
             if use_cache:
                 try:
-                    df.to_parquet(_cache_path(t), index=False)
+                    df.to_parquet(_cache_path(t, interval), index=False)
                 except Exception:  # noqa: BLE001
                     pass
             out[t] = add_indicators(df)
@@ -175,7 +180,7 @@ def load_universe(
 
     for t in need:
         try:
-            df = load_ticker(t, period=period, use_cache=use_cache)
+            df = load_ticker(t, period=period, use_cache=use_cache, interval=interval)
             if not df.empty:
                 out[t.upper()] = df
         except Exception as exc:  # noqa: BLE001

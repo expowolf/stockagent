@@ -486,13 +486,18 @@ class ProviderChain:
 
 def default_providers() -> List[DataProvider]:
     """
-    Ordered by quality, then breadth, then last resort:
+    Yahoo leads by choice: it needs no key, serves intraday candles down to
+    1-minute, and carries the news feed the watcher reads — so quotes and
+    headlines come from one consistent source.
 
-      1. Alpaca        official API, real-time IEX, batched, free — used when keys are set
-      2. yfinance      free and unlimited, but unofficial and breaks periodically
-      3. AlphaVantage  25 requests/day, so short-list only
+      1. yfinance      primary. Free, keyless, intraday + news.
+      2. Alpaca        used when keys are set; official API and batched, so it
+                       is the better backstop when Yahoo has an outage.
+      3. AlphaVantage  25 requests/day, short-list only.
 
-    Each is skipped automatically when unconfigured, so this order is safe
-    whether the user has zero keys or all of them.
+    Each is skipped automatically when unconfigured. Set KRONOS_PRIMARY=alpaca
+    to put Alpaca first instead.
     """
-    return [AlpacaProvider(), YFinanceProvider(), AlphaVantageProvider()]
+    if os.environ.get("KRONOS_PRIMARY", "yahoo").lower() in ("alpaca", "alpaca-first"):
+        return [AlpacaProvider(), YFinanceProvider(), AlphaVantageProvider()]
+    return [YFinanceProvider(), AlpacaProvider(), AlphaVantageProvider()]

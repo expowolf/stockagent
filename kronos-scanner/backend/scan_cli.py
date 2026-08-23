@@ -25,11 +25,11 @@ from agent import CreditGovernor, Screener, session_from_env
 from agent.screener import Verdict
 
 
-def _load(tickers: List[str], period: str) -> Dict[str, object]:
+def _load(tickers: List[str], period: str, interval: str = "1d") -> Dict[str, object]:
     """Fetch OHLCV. Returns {} when no data path is available."""
     from data.ingestion import load_universe
 
-    return load_universe(tickers, period=period)
+    return load_universe(tickers, period=period, interval=interval)
 
 
 def _signal_fn(ticker: str, df):
@@ -77,6 +77,13 @@ def main(argv=None) -> int:
     ap.add_argument("--notify", action="store_true", default=None,
                     help="push new TAKEs to your phone (auto-on when NTFY_TOPIC is set)")
     ap.add_argument("--no-notify", action="store_false", dest="notify")
+    ap.add_argument("--news", action="store_true", default=None,
+                    help="watch Yahoo Finance news for candidates (on by default)")
+    ap.add_argument("--no-news", action="store_false", dest="news")
+    ap.add_argument("--max-news", type=int, default=2,
+                    help="max tickers given a paid news read per sweep")
+    ap.add_argument("--interval", default="1d",
+                    help="candle interval: 1d, 1h, 15m, 5m, 1m (intraday = live candles)")
     args = ap.parse_args(argv)
 
     session = session_from_env()
@@ -94,11 +101,21 @@ def main(argv=None) -> int:
         token_budget=args.budget or 400_000,
         progress_fn=session.progress,
     )
-    screener = Screener(governor=governor, max_paid_per_scan=args.max_paid)
+    watcher = None
+    if args.news is not False:
+        from agent.news_watch import NewsWatcher
+
+        watcher = NewsWatcher(governor=governor, max_analyzed_per_scan=args.max_news)
+
+    screener = Screener(
+        governor=governor,
+        max_paid_per_scan=args.max_paid,
+        news_watcher=watcher,
+    )
 
     # Data. If egress is blocked this comes back empty — say so, never invent.
     try:
-        data = _load(universe, args.period)
+        data = _load(universe, args.period, args.interval)
     except Exception as exc:  # noqa: BLE001
         data = {}
         err = str(exc)
@@ -172,6 +189,7 @@ def main(argv=None) -> int:
         print(
             f"\nfunnel: {st.get('scanned',0)} scanned -> "
             f"{st.get('engines_run',0)} engines -> {st.get('screened',0)} screened"
+            + (f" -> {st['news_analyzed']} news reads" if st.get("news_analyzed") else "")
         )
 
     paid = sum(1 for v in verdicts if v.tier != "none")

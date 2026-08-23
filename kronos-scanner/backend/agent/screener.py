@@ -178,6 +178,7 @@ class Screener:
         strategy: Optional[Strategy] = None,
         max_paid_per_scan: int = 3,
         risk: Optional[RiskPolicy] = None,
+        news_watcher=None,
     ) -> None:
         self.governor = governor or CreditGovernor()
         self.strategy = strategy or load_strategy()
@@ -187,6 +188,9 @@ class Screener:
         # plugged-in strategy promotes far too many names — only the top-K by
         # conviction are paid for; the rest still get free-tier verdicts.
         self.max_paid_per_scan = max(0, int(max_paid_per_scan))
+        # Optional NewsWatcher. Only candidates get news, so a wide universe
+        # never triggers a wide news sweep.
+        self.news_watcher = news_watcher
         self._client = None
         # Fingerprints of setups already reported, to avoid duplicate alerts.
         self._seen: Dict[str, str] = {}
@@ -446,6 +450,33 @@ class Screener:
                 candidates.append((ctx, sig))
             except Exception as exc:  # noqa: BLE001
                 print(f"[screener] {ticker} failed: {exc}")
+
+        # --- Stage B2: news, for candidates only ----------------------------
+        if self.news_watcher is not None and candidates:
+            try:
+                ctxs = [c for c, _ in candidates]
+                reads = self.news_watcher.watch(
+                    [c.ticker for c in ctxs],
+                    price_context={
+                        c.ticker: (
+                            f"price ${c.price:.2f}, bias {c.pattern_bias:+.2f}"
+                            + (f", regime {c.hmm_regime}" if c.hmm_regime else "")
+                        )
+                        for c in ctxs
+                    },
+                )
+                for ctx, _sig in candidates:
+                    read = reads.get(ctx.ticker)
+                    if read is None:
+                        continue
+                    ctx.news_impact = read.impact
+                    ctx.news_magnitude = read.magnitude
+                    ctx.news_tradeable = read.tradeable
+                    ctx.news_note = read.note
+                    ctx.headlines = list(read.headlines)
+                self.stats["news_analyzed"] = self.news_watcher.stats.get("analyzed", 0)
+            except Exception as exc:  # noqa: BLE001 - news must never break a scan
+                print(f"[screener] news watch failed: {exc}")
 
         # --- Stage C: paid, top-K by conviction only ------------------------
         candidates.sort(key=lambda pair: -pair[1].conviction)

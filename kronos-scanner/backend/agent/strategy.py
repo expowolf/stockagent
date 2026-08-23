@@ -50,6 +50,12 @@ class MarketContext:
     pct_from_20d_low: Optional[float] = None
     atr_pct: Optional[float] = None        # ATR as fraction of price
     rsi_14: Optional[float] = None
+    # Yahoo Finance news (populated only for candidates; free unless analysed)
+    news_impact: Optional[str] = None      # "bullish" | "bearish" | "neutral"
+    news_magnitude: float = 0.0            # 0..1 expected near-term price impact
+    news_tradeable: bool = False
+    news_note: str = ""
+    headlines: List[str] = field(default_factory=list)
 
     def summary(self) -> str:
         """Compact one-line digest — this is what gets sent to the model."""
@@ -69,6 +75,8 @@ class MarketContext:
             bits.append(f"RSI={self.rsi_14:.0f}")
         if self.atr_pct is not None:
             bits.append(f"ATR={self.atr_pct*100:.2f}%")
+        if self.news_impact and self.news_magnitude > 0:
+            bits.append(f"news={self.news_impact}/{self.news_magnitude:.1f}")
         return " | ".join(bits)
 
 

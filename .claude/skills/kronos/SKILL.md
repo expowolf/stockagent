@@ -47,18 +47,43 @@ Then stop. Add at most one short line if something genuinely needs flagging
 Do **not** add: a table of every SKIP, per-name reasoning, market outlook,
 disclaimers, or a summary of what the numbers "mean".
 
-## Data providers
+## Data
 
-Tried in order, each skipped when unconfigured:
+**Yahoo Finance is primary** — free, keyless, and the source of both candles
+and news, so the two stay consistent. Alpaca and Alpha Vantage sit behind it
+as fallbacks and are skipped unless configured.
 
-| Provider | Free tier | Notes |
-|---|---|---|
-| **Alpaca** | real-time IEX, 200 req/min, 7yr history | **batches ~100 symbols/request** — best option |
-| yfinance | unlimited, no key | unofficial; breaks when Yahoo changes endpoints |
-| Alpha Vantage | 25 requests/**day** | short-list fallback only, quota-guarded |
+Live candles come from the interval flag, not a different provider:
 
-If the user asks about data health, run:
+```bash
+python scan_cli.py --interval 5m      # 5-minute candles
+python scan_cli.py --interval 1m      # 1-minute (last ~7 days only)
+```
+
+Daily is the default. Intraday caches under a separate key, so a 5m scan can
+never be served yesterday's daily bars.
+
+If the user asks about data health:
 `python -c "from data.ingestion import provider_status; print(provider_status())"`
+
+## News watching
+
+Yahoo Finance headlines are read for **candidates only** — never the whole
+universe — and every stage before the model call is free:
+
+1. fetch headlines (free)
+2. drop anything older than 24h (free)
+3. drop articles already analysed, ever (free, persisted)
+4. keyword materiality score; clickbait like "3 reasons to watch X" scores
+   0.13 and never costs a token (free)
+5. **one** call per ticker covering all its fresh headlines at once (paid)
+6. cache the result by article id — a repeat sweep is free
+
+Capped at 2 paid news reads per sweep (`--max-news`), and the credit governor
+can still refuse. `--no-news` disables it entirely.
+
+When a verdict cites news, relay the note as-is. Do not go fetch or summarize
+the article yourself — that defeats the entire cost design.
 
 ## Exit codes
 
