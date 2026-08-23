@@ -91,6 +91,26 @@ sweep typically spends a couple of small calls rather than twenty.
 | 2 | `strategy.screen()` | free |
 | 3 | Model call, top-K candidates only | paid, governed |
 
+### Trading session
+
+The agent runs on **your** clock. Defaults to **07:30–11:00 America/Denver** —
+the 09:30 ET open through the pre-lunch slowdown.
+
+| Phase | Local time | Cadence | Why |
+|-------|-----------|---------|-----|
+| `open-burst` | 07:30–08:30 | **150s** (2× faster) | Highest volatility, setups appear |
+| `core` | 08:30–10:00 | 300s | Steady mid-session |
+| `taper` | 10:00–11:00 | 540s (1.8× slower) | Tape quiets, stop spending on noise |
+
+Outside the window the loop **sleeps until the next open** rather than scanning
+a closed market. Weekends and all ten NYSE holidays are skipped automatically
+(rule-derived, including Good Friday and observed dates — nothing to maintain).
+
+Cadence tapering doubles as credit management: budget goes where the moves are.
+
+Tune via env: `KRONOS_TZ`, `KRONOS_SESSION_START`, `KRONOS_SESSION_END`,
+`KRONOS_BURST_MINUTES`, `KRONOS_TAPER_MINUTES`, `KRONOS_BASE_INTERVAL`.
+
 ### Credit governance
 
 `agent/budget.py` paces spend against elapsed time rather than burning budget
@@ -106,8 +126,19 @@ front-loaded.
 - **Adaptive interval** — the scan loop stretches or tightens to cover the
   remaining window.
 
-Measured: 36 sweeps over a 3-hour morning, every sweep hitting the cap, used
-**35% of spendable budget** with the reserve intact.
+Spend is paced against **session progress**, not wall-clock, so a 3.5h morning
+uses its allowance properly instead of trickling it across a 5h window.
+
+Measured over a full 07:30–11:00 MT session, every sweep hitting the paid cap
+(worst case — real mornings surface far fewer candidates):
+
+```
+sweeps      : 49   (24 burst / 18 core / 7 taper)
+tokens      : 153,700 / 320,000 spendable
+budget used : 48%
+reserve     : 80,000 untouched
+status      : headroom
+```
 
 Tune via env: `KRONOS_TOKEN_BUDGET`, `KRONOS_WINDOW_HOURS`, `KRONOS_RESERVE_PCT`,
 `KRONOS_MAX_PAID_PER_SCAN`, `KRONOS_UNIVERSE`.
@@ -131,7 +162,8 @@ funnel and the credit governor work before committing to any logic.
 | `GET /agent/ui` | Mobile page (add to home screen) |
 | `GET /agent/scan` | Run one sweep now |
 | `GET /agent/verdicts` | Last results, no re-run (free) |
-| `GET /agent/status` | Runner + credit status |
+| `GET /agent/status` | Runner + session + credit status |
+| `GET /agent/session` | Current phase in your timezone |
 | `POST /agent/start` \| `/agent/stop` | Control the auto-scan loop |
 
 ## Roadmap

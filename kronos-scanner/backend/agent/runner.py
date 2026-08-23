@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
 from .budget import CreditGovernor
+from .schedule import MarketSession, Phase, session_from_env
 from .screener import Screener, Verdict
 
 
@@ -31,6 +32,9 @@ class AgentRunner:
         screener: Optional[Screener] = None,
         on_take: Optional[Callable[[List[Verdict]], None]] = None,
         min_interval: float = 60.0,
+        session: Optional[MarketSession] = None,
+        base_interval: float = 300.0,
+        respect_session: bool = True,
     ) -> None:
         self.universe = [t.upper() for t in universe]
         self.load_fn = load_fn
@@ -39,6 +43,11 @@ class AgentRunner:
         self.screener = screener or Screener(governor=self.governor)
         self.on_take = on_take
         self.min_interval = min_interval
+        self.session = session or session_from_env()
+        self.base_interval = base_interval
+        # When True the loop only scans inside the configured session window.
+        self.respect_session = respect_session
+        self.sleeping_until_open = False
 
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -79,8 +88,42 @@ class AgentRunner:
         return verdicts
 
     # ------------------------------------------------------------------ loop
+    def _next_interval(self) -> float:
+        """
+        Seconds to wait before the next sweep.
+
+        Inside the session this is the phase-scaled cadence (fast at the open,
+        slower into the taper), floored by whatever the credit governor thinks
+        is sustainable for the time remaining.
+        """
+        cadence = self.session.cadence_seconds(self.base_interval)
+
+        if self.respect_session:
+            left = self.session.seconds_until_close()
+            if left > 0:
+                # Pace the governor over the rest of *this session*.
+                planned = max(1, int(left / max(cadence, 1.0)))
+                cadence = max(cadence, self.governor.suggest_interval(planned_cycles=planned))
+
+        return max(self.min_interval, cadence)
+
     def _loop(self, planned_cycles: int) -> None:
         while not self._stop.is_set():
+            # Outside the trading window: sleep until the open instead of
+            # scanning a closed market.
+            if self.respect_session and not self.session.is_active():
+                wait = self.session.seconds_until_open()
+                self.sleeping_until_open = True
+                phase = self.session.phase()
+                print(
+                    f"[runner] {phase}: sleeping {wait/60:.0f}m until next open "
+                    f"({self.session.tz_name})"
+                )
+                # Wake at least hourly so status stays fresh and stop() is responsive.
+                self._stop.wait(timeout=min(wait, 3600.0))
+                continue
+
+            self.sleeping_until_open = False
             try:
                 self.scan_once()
                 self.error = None
@@ -88,12 +131,8 @@ class AgentRunner:
                 self.error = f"{type(exc).__name__}: {exc}"
                 print(f"[runner] scan failed: {self.error}")
 
-            interval = max(
-                self.min_interval,
-                self.governor.suggest_interval(planned_cycles=planned_cycles),
-            )
             # Wait in slices so stop() is responsive.
-            self._stop.wait(timeout=interval)
+            self._stop.wait(timeout=self._next_interval())
 
     def start(self, planned_cycles: int = 36) -> bool:
         """Begin scanning in the background. Returns False if already running."""
@@ -128,15 +167,15 @@ class AgentRunner:
         takes = [v for v in verdicts if v.decision == "TAKE"]
         return {
             "running": self.is_running,
+            "sleeping_until_open": self.sleeping_until_open,
             "universe_size": len(self.universe),
             "scans_completed": count,
             "last_scan_at": scanned_at,
             "takes": len(takes),
             "skips": len(verdicts) - len(takes),
             "strategy": self.screener.strategy.name,
+            "session": self.session.describe(),
             "budget": self.governor.snapshot(),
-            "next_interval_seconds": round(
-                max(self.min_interval, self.governor.suggest_interval()), 1
-            ),
+            "next_interval_seconds": round(self._next_interval(), 1),
             "error": self.error,
         }

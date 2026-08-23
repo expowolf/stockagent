@@ -78,6 +78,7 @@ class CreditGovernor:
         reserve_pct: float = 0.20,
         slack: float = 0.08,
         state_path: Optional[str] = None,
+        progress_fn=None,
     ) -> None:
         self.token_budget = int(token_budget)
         self.window_seconds = float(window_hours) * 3600.0
@@ -87,6 +88,11 @@ class CreditGovernor:
             state_path
             or os.environ.get("KRONOS_BUDGET_STATE", "/tmp/kronos_budget.json")
         )
+        # Optional callable returning 0..1 progress through the *trading
+        # session*. When set, spend is paced across the hours actually being
+        # scanned rather than raw wall-clock, so a 3.5h morning uses its
+        # allowance properly instead of trickling it over a 5h window.
+        self.progress_fn = progress_fn
         self.state = self._load()
 
     # ----------------------------------------------------------------- state
@@ -130,8 +136,18 @@ class CreditGovernor:
 
     @property
     def elapsed_fraction(self) -> float:
-        """How far through the window we are, in [0, 1]."""
+        """
+        How far through the pacing period we are, in [0, 1].
+
+        Uses session progress when a `progress_fn` is supplied, otherwise falls
+        back to elapsed wall-clock within the usage window.
+        """
         self._roll_if_expired()
+        if self.progress_fn is not None:
+            try:
+                return min(1.0, max(0.0, float(self.progress_fn())))
+            except Exception:  # noqa: BLE001 - fall back rather than fail
+                pass
         elapsed = time.time() - self.state.window_started_at
         return min(1.0, max(0.0, elapsed / self.window_seconds))
 

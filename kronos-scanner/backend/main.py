@@ -310,7 +310,7 @@ async def tradingview_webhook(request: Request):
 # --------------------------------------------------------------------------- #
 from fastapi.responses import HTMLResponse  # noqa: E402
 
-from agent import CreditGovernor, Screener  # noqa: E402
+from agent import CreditGovernor, Screener, session_from_env  # noqa: E402
 from agent.runner import AgentRunner  # noqa: E402
 
 AGENT_UNIVERSE = [
@@ -319,10 +319,16 @@ AGENT_UNIVERSE = [
     if t.strip()
 ]
 
+# Trading window in your local timezone (default: 07:30-11:00 America/Denver,
+# i.e. the 09:30 ET open through the pre-lunch slowdown).
+_session = session_from_env()
+
 _governor = CreditGovernor(
     token_budget=int(os.environ.get("KRONOS_TOKEN_BUDGET", "400000")),
     window_hours=float(os.environ.get("KRONOS_WINDOW_HOURS", "5")),
     reserve_pct=float(os.environ.get("KRONOS_RESERVE_PCT", "0.20")),
+    # Pace spend across the trading session, not raw wall-clock.
+    progress_fn=_session.progress,
 )
 _screener = Screener(
     governor=_governor,
@@ -356,7 +362,15 @@ _agent = AgentRunner(
     governor=_governor,
     screener=_screener,
     on_take=_on_take,
+    session=_session,
+    base_interval=float(os.environ.get("KRONOS_BASE_INTERVAL", "300")),
 )
+
+
+@app.get("/agent/session")
+def agent_session():
+    """Where we are in your trading day, in your timezone."""
+    return _session.describe()
 
 
 @app.get("/agent/status")
@@ -427,6 +441,8 @@ h1 span{color:#22d3ee}
       text-transform:uppercase;letter-spacing:.04em}
 .on-pace{background:#052e16;color:#4ade80}.throttling{background:#422006;color:#fbbf24}
 .headroom{background:#082f49;color:#38bdf8}.exhausted-degraded-to-free{background:#450a0a;color:#f87171}
+.open-burst{background:#052e16;color:#4ade80}.core{background:#082f49;color:#38bdf8}
+.taper{background:#422006;color:#fbbf24}.closed,.done,.premarket{background:#27272a;color:#a1a1aa}
 .card{background:#18181b;border:1px solid #27272a;border-left-width:4px;border-radius:12px;
       padding:13px 14px;margin-bottom:9px;display:flex;gap:12px;align-items:center}
 .card.take{border-left-color:#22c55e;background:#0b1f14}
@@ -449,6 +465,12 @@ button.ghost{background:#27272a;color:#d4d4d8}
   <h1>KRONOS <span>agent</span></h1>
   <div class="meta" id="stamp">—</div>
 </header>
+
+<div class="budget">
+  <div class="row"><span>Session</span><span id="sphase" class="pill">—</span></div>
+  <div class="bar"><i id="sfill" style="width:0%;background:#22d3ee"></i></div>
+  <div class="row"><span id="swin">—</span><span id="snext">—</span></div>
+</div>
 
 <div class="budget">
   <div class="row"><span>Credits</span><span id="bstat" class="pill">—</span></div>
@@ -495,8 +517,22 @@ function paint(d){
     </div>`}).join('');
 }
 
+function paintSession(s){
+  const p=document.getElementById('sphase');
+  p.textContent=(s.phase||'—').replace(/-/g,' ');
+  p.className='pill '+(s.phase||'');
+  document.getElementById('sfill').style.width=(s.session_progress_pct||0)+'%';
+  document.getElementById('swin').textContent=s.window+' '+(s.timezone||'').split('/').pop();
+  document.getElementById('snext').textContent = s.active
+    ? Math.round(s.minutes_until_close)+'m left · scan x'+s.cadence_multiplier
+    : (s.minutes_until_open>90
+        ? 'opens in '+(s.minutes_until_open/60).toFixed(1)+'h'
+        : 'opens in '+Math.round(s.minutes_until_open)+'m');
+}
+
 async function load(){
   try{paint(await (await fetch('/agent/verdicts')).json())}catch(e){}
+  try{paintSession(await (await fetch('/agent/session')).json())}catch(e){}
 }
 async function scan(){
   const b=document.getElementById('scan');
