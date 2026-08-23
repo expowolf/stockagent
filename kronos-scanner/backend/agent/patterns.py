@@ -183,24 +183,31 @@ def dedupe(patterns: List[Pattern]) -> List[Pattern]:
     return out
 
 
-def net_bias(patterns: List[Pattern], decay: float = 0.55) -> float:
+def net_bias(patterns: List[Pattern], decay: float = 0.55, scale: float = 1.2) -> float:
     """
     Collapse detected patterns into one score in [-1, 1].
 
-    Patterns are de-duplicated first, then weighted by recency. The decay is
-    steep on purpose: a reversal printing today should outweigh the trend it
-    reverses, which is the entire point of a reversal signal.
+    Patterns are de-duplicated, weighted by recency (steep decay, because a
+    reversal printing today should outweigh the trend it reverses), then
+    squashed with tanh.
+
+    The squash matters: dividing by total weight — the obvious approach —
+    throws away confidence entirely, because a lone weak pattern normalizes to
+    exactly the same +/-1.0 as three strong aligned ones. Summing first and
+    saturating preserves BOTH direction and conviction, so the magnitude is
+    usable as a filter:
+
+        one weak harami (0.45)          -> ~0.35
+        one strong engulfing (0.8)      -> ~0.58
+        three aligned strong patterns   -> ~0.85
+        two strong patterns in conflict -> ~0.0
     """
     if not patterns:
         return 0.0
 
     score = 0.0
-    weight_sum = 0.0
     for p in dedupe(patterns):
         w = (decay ** p.bars_ago) * p.strength
         score += w if p.direction == "bullish" else -w
-        weight_sum += w
 
-    if weight_sum == 0:
-        return 0.0
-    return float(np.clip(score / weight_sum, -1.0, 1.0))
+    return float(np.tanh(score / scale))

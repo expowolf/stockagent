@@ -2,13 +2,19 @@
 """
 The cost funnel.
 
-Stage 0  load cached OHLCV                      free
-Stage 1  candlestick patterns + quant engines   free
-Stage 2  strategy.screen()                      free
-Stage 3  model call on survivors only           paid, governed
+Three escalating gates, each far more expensive than the last, so cost tracks
+the number of *interesting* names rather than universe size:
 
-Only names surviving stages 1-2 ever reach a paid tier, so a 20-ticker sweep
-typically costs one or two small calls rather than twenty.
+  A  patterns + strategy.prefilter()   ~0.3ms/ticker   every name
+  B  quant engines + strategy.screen() ~95ms/ticker    stage-A survivors only
+  C  model call                        tokens          top-K by conviction only
+
+Stage B is ~300x the cost of stage A, which is the whole reason A exists: on a
+570-name universe the prefilter drops well over half before any engine runs,
+roughly halving sweep time.
+
+Token cost is independent of universe size — only stage C spends, and it is
+capped at `max_paid_per_scan` regardless of how many names were scanned.
 """
 
 from __future__ import annotations
@@ -50,7 +56,8 @@ class Verdict:
     # Risk-gate output
     rr: Optional[float] = None
     stop_pct: Optional[float] = None
-    shares: Optional[int] = None
+    shares: Optional[float] = None
+    notional: Optional[float] = None
     risk_amount: Optional[float] = None
     warnings: list = field(default_factory=list)
     at: str = ""
@@ -68,7 +75,9 @@ class Verdict:
         if self.target:
             lines.append(f"target ${self.target:.2f}" + (f"  R:R {self.rr:.1f}" if self.rr else ""))
         if self.shares:
-            lines.append(f"size {self.shares} sh  risk ${self.risk_amount:,.0f}")
+            lines.append(
+                f"size {self.shares:g} sh (${self.notional:,.0f})  risk ${self.risk_amount:,.2f}"
+            )
         if self.reason:
             lines.append(self.reason)
         for w in self.warnings or []:
@@ -105,6 +114,17 @@ def _structure(df) -> dict:
         out["rsi_14"] = float(val) if val == val else None  # NaN check
 
     return out
+
+
+def _attach_signals(ctx: MarketContext, signals) -> None:
+    """Copy quant-engine outputs onto a context built from patterns alone."""
+    ctx.ou_score = signals.ou_score
+    ctx.ou_halflife = signals.ou_halflife
+    ctx.hmm_regime = signals.hmm_regime
+    ctx.hmm_confidence = signals.hmm_confidence
+    ctx.kalman_alpha = signals.kalman_alpha
+    ctx.evt_var_99 = signals.evt_var_99
+    ctx.evt_expected_shortfall = signals.evt_expected_shortfall
 
 
 def build_context(ticker: str, df, signals=None) -> MarketContext:
@@ -296,6 +316,7 @@ class Screener:
         v.rr = ra.rr
         v.stop_pct = ra.stop_pct
         v.shares = ra.shares
+        v.notional = ra.notional
         v.risk_amount = ra.risk_amount
         return v
 
@@ -345,32 +366,88 @@ class Screener:
             return verdict
         return self._paid_verdict(ctx, sig)
 
-    def scan(self, data: Dict[str, object], signals_by_ticker: Optional[dict] = None) -> List[Verdict]:
+    def scan(
+        self,
+        data: Dict[str, object],
+        signals_by_ticker: Optional[dict] = None,
+        signal_fn=None,
+    ) -> List[Verdict]:
         """
         Run the funnel across a universe.
 
-        Every name gets the free stages. Only the top `max_paid_per_scan`
-        actionable candidates, ranked by conviction, are paid for — so a sweep
-        has a hard, predictable cost ceiling no matter how many names a
-        strategy promotes.
+        Three escalating gates, each more expensive than the last, so cost
+        tracks the number of *interesting* names rather than universe size:
+
+          A. patterns + prefilter   ~0.3ms/ticker   every name
+          B. quant engines + screen ~50ms/ticker    prefilter survivors only
+          C. model call             tokens          top-K by conviction only
+
+        Pass `signal_fn(ticker, df)` to have engines computed lazily in stage B
+        — that is what makes a several-hundred-name universe practical.
+        A precomputed `signals_by_ticker` dict still works for small sweeps.
         """
         signals_by_ticker = signals_by_ticker or {}
         out: List[Verdict] = []
+        survivors = []   # (ticker, df, ctx) that cleared the cheap gate
         candidates = []  # (ctx, sig) awaiting a paid verdict
 
+        self.stats = {"scanned": 0, "prefiltered": 0, "engines_run": 0, "screened": 0}
+
+        # --- Stage A: patterns only. Engines have NOT run. -------------------
         for ticker, df in data.items():
             try:
                 if df is None or len(df) < 30:
                     continue
-                ctx, sig, verdict = self._free_pass(ticker, df, signals_by_ticker.get(ticker))
-                if verdict is not None:
-                    out.append(verdict)
-                else:
-                    candidates.append((ctx, sig))
+                self.stats["scanned"] += 1
+                ctx = build_context(ticker, df, signals_by_ticker.get(ticker))
+
+                if not self.strategy.prefilter(ctx):
+                    self.stats["prefiltered"] += 1
+                    out.append(Verdict(
+                        ticker=ctx.ticker, decision="SKIP", confidence=0.0,
+                        reason="no price-action signal", price=ctx.price,
+                        tier=Tier.NONE.value, at=self._now(),
+                    ))
+                    continue
+                survivors.append((ticker, df, ctx))
             except Exception as exc:  # noqa: BLE001 - one bad name can't stop the sweep
+                print(f"[screener] {ticker} prefilter failed: {exc}")
+
+        # --- Stage B: engines, then the full screen -------------------------
+        for ticker, df, ctx in survivors:
+            try:
+                if signal_fn is not None and ticker not in signals_by_ticker:
+                    sigs = signal_fn(ticker, df)
+                    self.stats["engines_run"] += 1
+                    if sigs is not None:
+                        _attach_signals(ctx, sigs)
+
+                if not self.strategy.screen(ctx):
+                    out.append(Verdict(
+                        ticker=ctx.ticker, decision="SKIP", confidence=0.0,
+                        reason="filtered: no structural setup", price=ctx.price,
+                        tier=Tier.NONE.value, at=self._now(),
+                    ))
+                    continue
+
+                self.stats["screened"] += 1
+                sig = self.strategy.evaluate(ctx)
+
+                if not sig.actionable:
+                    out.append(self._apply_risk(Verdict(
+                        ticker=ctx.ticker, decision="SKIP", confidence=0.0,
+                        reason=sig.rationale or "strategy abstained", price=ctx.price,
+                        tier=Tier.NONE.value, entry=sig.entry,
+                        invalidation=sig.invalidation, target=sig.target,
+                        at=self._now(),
+                    ), ctx, sig))
+                    continue
+
+                candidates.append((ctx, sig))
+            except Exception as exc:  # noqa: BLE001
                 print(f"[screener] {ticker} failed: {exc}")
 
-        # Highest conviction first, then spend down to the cap.
+        # --- Stage C: paid, top-K by conviction only ------------------------
         candidates.sort(key=lambda pair: -pair[1].conviction)
         for i, (ctx, sig) in enumerate(candidates):
             if i < self.max_paid_per_scan:

@@ -32,16 +32,20 @@ def _load(tickers: List[str], period: str) -> Dict[str, object]:
     return load_universe(tickers, period=period)
 
 
-def _signals(data: Dict[str, object]) -> dict:
+def _signal_fn(ticker: str, df):
+    """
+    Compute the quant engines for ONE ticker, on demand.
+
+    Passed to Screener.scan so engines run only for names that clear the cheap
+    pattern prefilter — the difference between ~26s and ~54s on a 570-name
+    universe.
+    """
     from main import compute_signals
 
-    out = {}
-    for ticker, df in data.items():
-        try:
-            out[ticker] = compute_signals(ticker, df)
-        except Exception:  # noqa: BLE001 - a bad name shouldn't stop the sweep
-            pass
-    return out
+    try:
+        return compute_signals(ticker, df)
+    except Exception:  # noqa: BLE001 - a bad name shouldn't stop the sweep
+        return None
 
 
 def _fmt(v: Verdict, wide: bool) -> str:
@@ -55,7 +59,7 @@ def _fmt(v: Verdict, wide: bool) -> str:
         if v.rr:
             line += f" rr{v.rr:.1f}"
         if v.shares:
-            line += f" {v.shares}sh"
+            line += f" {v.shares:g}sh"
     if wide or v.decision == "TAKE":
         line += f"  {v.reason[:58]}"
     return line
@@ -83,7 +87,7 @@ def main(argv=None) -> int:
     else:
         from data.ingestion import DEFAULT_UNIVERSE
 
-        raw = os.environ.get("KRONOS_UNIVERSE", ",".join(DEFAULT_UNIVERSE[:20]))
+        raw = os.environ.get("KRONOS_UNIVERSE", ",".join(DEFAULT_UNIVERSE))
         universe = [t.strip().upper() for t in raw.split(",") if t.strip()]
 
     governor = CreditGovernor(
@@ -115,7 +119,7 @@ def main(argv=None) -> int:
             print("Nothing scanned. No verdicts produced.")
         return 2
 
-    verdicts = screener.scan(data, _signals(data))
+    verdicts = screener.scan(data, signal_fn=_signal_fn)
     takes = [v for v in verdicts if v.decision == "TAKE"]
     snap = governor.snapshot()
 
@@ -163,8 +167,15 @@ def main(argv=None) -> int:
         if not args.all:
             print(f"\n+{len(verdicts) - len(takes)} SKIP")
 
+    st = getattr(screener, "stats", {})
+    if st:
+        print(
+            f"\nfunnel: {st.get('scanned',0)} scanned -> "
+            f"{st.get('engines_run',0)} engines -> {st.get('screened',0)} screened"
+        )
+
     paid = sum(1 for v in verdicts if v.tier != "none")
-    tail = f"\ncost: {paid} paid call(s), {snap['spent_tokens']:,} tokens used this window"
+    tail = f"cost: {paid} paid call(s), {snap['spent_tokens']:,} tokens used this window"
     if want_notify:
         tail += f" · {pushed} phone alert(s) sent"
     elif takes:

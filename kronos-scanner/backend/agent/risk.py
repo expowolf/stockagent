@@ -36,7 +36,8 @@ class RiskAssessment:
     reason: str
     rr: Optional[float] = None            # reward-to-risk ratio
     stop_pct: Optional[float] = None      # stop distance as fraction of entry
-    shares: Optional[int] = None          # position size under the risk rule
+    shares: Optional[float] = None        # position size under the risk rule
+    notional: Optional[float] = None      # dollars deployed
     risk_amount: Optional[float] = None   # dollars at risk if stopped
     warnings: Optional[list] = None
 
@@ -50,7 +51,7 @@ class RiskAssessment:
         if self.stop_pct is not None:
             bits.append(f"risk {self.stop_pct*100:.1f}%")
         if self.shares:
-            bits.append(f"{self.shares} sh")
+            bits.append(f"{self.shares:g} sh")
         return " · ".join(bits)
 
 
@@ -65,6 +66,7 @@ class RiskPolicy:
     min_stop_pct: float = 0.003        # a <0.3% stop is inside the spread
     min_stop_atr_mult: float = 0.5     # stop must clear half the daily range
     veto_inside_noise: bool = True
+    allow_fractional: bool = True      # most brokers support fractional shares
 
     @classmethod
     def from_env(cls) -> "RiskPolicy":
@@ -80,6 +82,7 @@ class RiskPolicy:
             min_rr=_f("KRONOS_MIN_RR", 1.5),
             max_stop_pct=_f("KRONOS_MAX_STOP_PCT", 0.10),
             veto_inside_noise=os.environ.get("KRONOS_VETO_NOISE", "1") != "0",
+            allow_fractional=os.environ.get("KRONOS_FRACTIONAL", "1") != "0",
         )
 
     # ------------------------------------------------------------------ assess
@@ -164,18 +167,45 @@ class RiskPolicy:
 
         # Rule 2 — fixed fractional sizing off the stop, not off conviction.
         risk_budget = self.account_size * self.risk_per_trade_pct
-        shares = int(risk_budget // risk_per_share)
-        if shares < 1:
-            return RiskAssessment(
-                approved=False,
-                reason=(
-                    f"position size < 1 share at {self.risk_per_trade_pct*100:.0f}% risk "
-                    f"(needs ${risk_per_share:.2f}/share)"
-                ),
-                rr=rr,
-                stop_pct=stop_pct,
-                warnings=warnings,
+        raw_shares = risk_budget / risk_per_share
+
+        if self.allow_fractional:
+            shares = round(raw_shares, 4)
+            if shares <= 0:
+                return RiskAssessment(
+                    approved=False,
+                    reason="position size rounds to zero",
+                    rr=rr, stop_pct=stop_pct, warnings=warnings,
+                )
+        else:
+            shares = int(raw_shares)
+            if shares < 1:
+                return RiskAssessment(
+                    approved=False,
+                    reason=(
+                        f"< 1 whole share at {self.risk_per_trade_pct*100:.1f}% risk "
+                        f"(stop is ${risk_per_share:.2f}/share) — enable fractional shares"
+                    ),
+                    rr=rr, stop_pct=stop_pct, warnings=warnings,
+                )
+
+        notional = shares * entry
+        if notional > self.account_size:
+            # Can't buy more than the account holds, even if the stop allows it.
+            capped = self.account_size / entry
+            capped = round(capped, 4) if self.allow_fractional else int(capped)
+            if capped <= 0:
+                return RiskAssessment(
+                    approved=False,
+                    reason=f"share price ${entry:.2f} exceeds account ${self.account_size:,.0f}",
+                    rr=rr, stop_pct=stop_pct, warnings=warnings,
+                )
+            warnings.append(
+                f"capped by buying power: {shares:g}->{capped:g} sh "
+                f"(risk ${capped*risk_per_share:.2f} not ${risk_budget:.2f})"
             )
+            shares = capped
+            notional = shares * entry
 
         return RiskAssessment(
             approved=True,
@@ -183,6 +213,7 @@ class RiskPolicy:
             rr=rr,
             stop_pct=stop_pct,
             shares=shares,
+            notional=round(notional, 2),
             risk_amount=round(shares * risk_per_share, 2),
             warnings=warnings,
         )

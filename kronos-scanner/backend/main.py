@@ -315,7 +315,7 @@ from agent.runner import AgentRunner  # noqa: E402
 
 AGENT_UNIVERSE = [
     t.strip().upper()
-    for t in os.environ.get("KRONOS_UNIVERSE", ",".join(DEFAULT_UNIVERSE[:20])).split(",")
+    for t in os.environ.get("KRONOS_UNIVERSE", ",".join(DEFAULT_UNIVERSE)).split(",")
     if t.strip()
 ]
 

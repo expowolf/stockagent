@@ -93,13 +93,34 @@ class Strategy(ABC):
 
     name: str = "unnamed"
 
+    def prefilter(self, ctx: MarketContext) -> bool:
+        """
+        FIRST gate, and the one that makes a large universe practical.
+
+        Called with candlestick patterns and structure only — the quant engines
+        have NOT run yet, because they cost ~167x more per ticker than pattern
+        detection (50ms vs 0.3ms). Whatever this rejects never pays that cost,
+        so scanning hundreds of names stays cheap.
+
+        `ctx.ou_score`, `ctx.hmm_regime`, `ctx.kalman_alpha` and
+        `ctx.evt_var_99` are all None here — do not read them.
+
+        Default: require a real directional lean (|bias| >= 0.35), which passes
+        roughly 45% of a broad universe and so halves engine work. Override
+        this — a trend strategy in particular should decide here, from price
+        structure alone, whether a name is even in the right regime to bother
+        costing 50ms on.
+        """
+        return abs(ctx.pattern_bias) >= 0.35
+
     @abstractmethod
     def screen(self, ctx: MarketContext) -> bool:
         """
-        FREE tier. Return True only if this name is worth spending tokens on.
+        SECOND gate. Full context — engines have run by now.
 
-        This is your primary cost control: the stricter this is, the fewer
-        paid calls the agent makes. Aim to pass ~10-20% of the universe.
+        Return True only if this name is worth spending tokens on. This is your
+        primary cost control: the stricter this is, the fewer paid calls the
+        agent makes. Aim to pass ~10-20% of the universe.
         """
 
     @abstractmethod
