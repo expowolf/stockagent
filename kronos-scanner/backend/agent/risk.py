@@ -59,8 +59,16 @@ class RiskAssessment:
 class RiskPolicy:
     """Tunable, but the defaults are the conventional ones."""
 
-    account_size: float = 10_000.0
+    account_size: float = 570.0
     risk_per_trade_pct: float = 0.01   # 1% of account per trade
+    # Below this, spread and fees start to rival the trade's own risk budget,
+    # which quietly inverts the edge. Warned, not blocked — it is a judgement
+    # call, not a structural fault.
+    min_risk_dollars: float = 8.0
+    # Fraction of the account a single position may occupy before it is worth
+    # flagging. Note risk% / stop% = account fraction deployed, so a tight stop
+    # concentrates heavily even at a small risk percentage.
+    max_notional_pct: float = 0.60
     min_rr: float = 1.5                # never pay 1 to make less than 1.5
     max_stop_pct: float = 0.10         # a >10% stop is a position-size problem
     min_stop_pct: float = 0.003        # a <0.3% stop is inside the spread
@@ -77,12 +85,14 @@ class RiskPolicy:
                 return default
 
         return cls(
-            account_size=_f("KRONOS_ACCOUNT_SIZE", 10_000.0),
+            account_size=_f("KRONOS_ACCOUNT_SIZE", 570.0),
             risk_per_trade_pct=_f("KRONOS_RISK_PER_TRADE", 0.01),
             min_rr=_f("KRONOS_MIN_RR", 1.5),
             max_stop_pct=_f("KRONOS_MAX_STOP_PCT", 0.10),
             veto_inside_noise=os.environ.get("KRONOS_VETO_NOISE", "1") != "0",
             allow_fractional=os.environ.get("KRONOS_FRACTIONAL", "1") != "0",
+            min_risk_dollars=_f("KRONOS_MIN_RISK_DOLLARS", 8.0),
+            max_notional_pct=_f("KRONOS_MAX_NOTIONAL_PCT", 0.60),
         )
 
     # ------------------------------------------------------------------ assess
@@ -206,6 +216,18 @@ class RiskPolicy:
             )
             shares = capped
             notional = shares * entry
+
+        realized_risk = shares * risk_per_share
+        if realized_risk < self.min_risk_dollars:
+            warnings.append(
+                f"risk ${realized_risk:.2f} is small — spread and fees may exceed "
+                f"the trade's own risk budget"
+            )
+        if notional > self.account_size * self.max_notional_pct:
+            warnings.append(
+                f"position is {notional/self.account_size*100:.0f}% of the account "
+                f"(tight stop concentrates size even at low risk %)"
+            )
 
         return RiskAssessment(
             approved=True,
