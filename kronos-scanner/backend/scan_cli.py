@@ -136,6 +136,14 @@ def main(argv=None) -> int:
             print("Nothing scanned. No verdicts produced.")
         return 2
 
+    # Partial-fetch check. A sweep where most of the universe failed to load
+    # is NOT a clean "no setups" result — without this, one cached ticker makes
+    # a totally broken fetch look like a successful quiet scan.
+    requested = len(universe)
+    loaded = len(data)
+    missing = requested - loaded
+    partial = missing > 0
+
     verdicts = screener.scan(data, signal_fn=_signal_fn)
     takes = [v for v in verdicts if v.decision == "TAKE"]
     snap = governor.snapshot()
@@ -166,9 +174,12 @@ def main(argv=None) -> int:
             "ok": True,
             "session": desc,
             "budget": snap,
+            "loaded": loaded,
+            "requested": requested,
+            "partial": partial,
             "verdicts": [v.to_dict() for v in verdicts],
         }))
-        return 0
+        return 3 if (requested and missing / requested >= 0.5) else 0
 
     # ALERT lines: exactly the new TAKEs, one line each, for Claude to push.
     # Absence of these lines means there is nothing new to notify about.
@@ -182,8 +193,12 @@ def main(argv=None) -> int:
     # --- compact human output ------------------------------------------------
     print(
         f"KRONOS  {desc['local_time']}  ·  {desc['phase']}"
-        f"  ·  {len(data)} scanned  ·  credits {snap['percent_used']}% ({snap['status']})"
+        f"  ·  {loaded}/{requested} loaded  ·  credits {snap['percent_used']}% ({snap['status']})"
     )
+    if partial:
+        pct = 100.0 * missing / max(requested, 1)
+        flag = "DATA WARNING" if pct >= 50 else "note"
+        print(f"{flag}: {missing} of {requested} tickers failed to load ({pct:.0f}%)")
     if not session.is_active() and not args.ignore_session:
         print(f"(outside {desc['window']} {desc['timezone']} — results still valid)")
 
@@ -211,6 +226,11 @@ def main(argv=None) -> int:
     if want_notify:
         tail += f" ({pushed} via ntfy)"
     print(tail)
+
+    # Exit 3 when most of the universe is missing: succeeded structurally, but
+    # the result is not trustworthy as a market read.
+    if requested and missing / requested >= 0.5:
+        return 3
     return 0
 
 
