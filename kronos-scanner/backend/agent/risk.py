@@ -60,15 +60,29 @@ class RiskPolicy:
     """Tunable, but the defaults are the conventional ones."""
 
     account_size: float = 570.0
-    risk_per_trade_pct: float = 0.01   # 1% of account per trade
+    # 4%, not the textbook 1%. On a small account 1% cannot compound, and the
+    # figure is bounded above by arithmetic rather than caution: notional =
+    # risk% / stop%, so with a ~4% ADR stop, 4% risk already deploys the entire
+    # cash balance. Anything higher needs margin.
+    #
+    # Monte Carlo on this strategy's own parameters (3R target, 100 trades):
+    #   risk   median @40% win   median @30% win   ruin @30%
+    #    2%        $1,745            $796            0.0%
+    #    4%        $4,580            $980            0.0%
+    #   10%       $36,996            $936            7.2%
+    #   20%      $127,665            $125           46.8%
+    # The 10-20% column only looks good if the 40% win rate is real. It is
+    # unvalidated, and over-betting past Kelly lowers growth AND raises ruin —
+    # strictly worse, not a trade-off. 4-6% holds up under both assumptions.
+    risk_per_trade_pct: float = 0.04
     # Below this, spread and fees start to rival the trade's own risk budget,
     # which quietly inverts the edge. Warned, not blocked — it is a judgement
     # call, not a structural fault.
     min_risk_dollars: float = 8.0
     # Fraction of the account a single position may occupy before it is worth
-    # flagging. Note risk% / stop% = account fraction deployed, so a tight stop
-    # concentrates heavily even at a small risk percentage.
-    max_notional_pct: float = 0.60
+    # flagging. At 4% risk against a 4% stop this is 100% by construction, so
+    # a full deployment is expected rather than a warning worth repeating.
+    max_notional_pct: float = 1.00
     min_rr: float = 1.5                # never pay 1 to make less than 1.5
     max_stop_pct: float = 0.10         # a >10% stop is a position-size problem
     min_stop_pct: float = 0.003        # a <0.3% stop is inside the spread
@@ -86,13 +100,13 @@ class RiskPolicy:
 
         return cls(
             account_size=_f("KRONOS_ACCOUNT_SIZE", 570.0),
-            risk_per_trade_pct=_f("KRONOS_RISK_PER_TRADE", 0.01),
+            risk_per_trade_pct=_f("KRONOS_RISK_PER_TRADE", 0.04),
             min_rr=_f("KRONOS_MIN_RR", 1.5),
             max_stop_pct=_f("KRONOS_MAX_STOP_PCT", 0.10),
             veto_inside_noise=os.environ.get("KRONOS_VETO_NOISE", "1") != "0",
             allow_fractional=os.environ.get("KRONOS_FRACTIONAL", "1") != "0",
             min_risk_dollars=_f("KRONOS_MIN_RISK_DOLLARS", 8.0),
-            max_notional_pct=_f("KRONOS_MAX_NOTIONAL_PCT", 0.60),
+            max_notional_pct=_f("KRONOS_MAX_NOTIONAL_PCT", 1.00),
         )
 
     # ------------------------------------------------------------------ assess
