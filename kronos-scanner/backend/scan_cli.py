@@ -140,14 +140,18 @@ def main(argv=None) -> int:
     takes = [v for v in verdicts if v.decision == "TAKE"]
     snap = governor.snapshot()
 
-    # Push new TAKEs to the phone. Deduped, so re-running under /loop does not
-    # re-alert the same setup. Every alert carries its stop loss.
+    # Which TAKEs are genuinely new? Deduped across processes, so /loop will
+    # not re-alert the same setup every five minutes.
+    fresh = screener.new_takes(verdicts)
+
+    # Optional ntfy push. Off unless NTFY_TOPIC is set — the primary alert
+    # path is Claude itself, which relays the ALERT lines printed below.
     pushed = 0
     want_notify = args.notify if args.notify is not None else bool(os.environ.get("NTFY_TOPIC"))
     if want_notify:
         from notify import push
 
-        for v in screener.new_takes(verdicts):
+        for v in fresh:
             ok = push(
                 title=f"TAKE {v.ticker} ${v.price:.2f} · stop ${v.invalidation:.2f}"
                 if v.invalidation else f"TAKE {v.ticker} ${v.price:.2f}",
@@ -165,6 +169,15 @@ def main(argv=None) -> int:
             "verdicts": [v.to_dict() for v in verdicts],
         }))
         return 0
+
+    # ALERT lines: exactly the new TAKEs, one line each, for Claude to push.
+    # Absence of these lines means there is nothing new to notify about.
+    for v in fresh:
+        stop = f"stop ${v.invalidation:.2f}" if v.invalidation else "no stop"
+        size = f" · {v.shares:g}sh risk ${v.risk_amount:,.2f}" if v.shares else ""
+        print(f"ALERT: TAKE {v.ticker} ${v.price:.2f} · {stop}{size}")
+    if fresh:
+        print()
 
     # --- compact human output ------------------------------------------------
     print(
@@ -194,10 +207,9 @@ def main(argv=None) -> int:
 
     paid = sum(1 for v in verdicts if v.tier != "none")
     tail = f"cost: {paid} paid call(s), {snap['spent_tokens']:,} tokens used this window"
+    tail += f" · {len(fresh)} new alert(s)"
     if want_notify:
-        tail += f" · {pushed} phone alert(s) sent"
-    elif takes:
-        tail += " · notifications off (set NTFY_TOPIC)"
+        tail += f" ({pushed} via ntfy)"
     print(tail)
     return 0
 

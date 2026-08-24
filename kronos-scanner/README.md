@@ -19,10 +19,6 @@ kronos-scanner/
 │   ├── data/ingestion.py       yfinance loader + parquet caching + indicators
 │   ├── Dockerfile
 │   └── requirements.txt
-├── frontend/
-│   ├── pages/index.tsx         Scan dashboard
-│   ├── components/TradingViewChart.tsx
-│   └── package.json
 └── docker-compose.yml          PostgreSQL + FastAPI
 ```
 
@@ -44,16 +40,6 @@ serves computed signals, it just skips persistence.
 ```bash
 docker compose up --build          # Postgres + backend on :8000
 ```
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev                        # http://localhost:3000
-```
-
-Set `NEXT_PUBLIC_API_BASE` if the backend is not on `http://localhost:8000`.
 
 ## API
 

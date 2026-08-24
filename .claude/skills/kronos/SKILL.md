@@ -104,15 +104,30 @@ For a continuous session, this composes with `/loop`:
 The CLI is already session-aware (07:30–11:00 MT, phase-tapered cadence) and
 credit-governed, so repeated invocations stay inside budget on their own.
 
-## Phone alerts
+## Alerts — go through Claude
 
-New TAKEs push to the phone automatically when `NTFY_TOPIC` is set. Every
-alert carries its **stop loss** in both the title and body, plus position size
-under the 1% rule. Alerts are deduped, so `/loop` will not re-alert the same
-setup.
+The CLI prints `ALERT:` lines for TAKEs that are **new since the last run**:
 
-If a TAKE appears but the summary says `notifications off`, tell the user once
-that `NTFY_TOPIC` is unset — don't repeat it every scan.
+```
+ALERT: TAKE XOM $53.42 · stop $51.24 · 2.6211sh risk $5.70
+```
+
+**For every `ALERT:` line, call `PushNotification`.** That is the notification
+channel — it reaches the user's phone through Claude, no third-party app.
+
+- One notification per ALERT line, under 200 chars, no markdown.
+- **Always lead with ticker, price, and stop loss.** The stop is the point.
+- Example: `TAKE XOM $53.42 — stop $51.24, 2.62sh, risk $5.70`
+
+**No `ALERT:` lines means send nothing.** A TAKE can still appear in the table
+without an ALERT line — that means it was already notified on an earlier sweep
+and must not be re-sent. Dedupe is persisted across runs, so trust it: never
+push a notification for a TAKE that has no ALERT line.
+
+Do not notify for SKIPs, scan completion, or "no setups found". Under `/loop`
+most sweeps should produce no notification at all.
+
+ntfy (`NTFY_TOPIC`) is optional and off by default — Claude is the primary path.
 
 ## Risk gate
 

@@ -23,6 +23,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, asdict, field
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -192,8 +193,36 @@ class Screener:
         # never triggers a wide news sweep.
         self.news_watcher = news_watcher
         self._client = None
-        # Fingerprints of setups already reported, to avoid duplicate alerts.
-        self._seen: Dict[str, str] = {}
+        # Fingerprints of setups already alerted, PERSISTED to disk.
+        # In-memory alone is not enough: each CLI invocation builds a new
+        # Screener, so under /loop every sweep would re-alert the same setup.
+        self._seen_path = Path(
+            os.environ.get("KRONOS_ALERTED_STATE", "/tmp/kronos_alerted.json")
+        )
+        self._seen: Dict[str, str] = self._load_seen()
+
+    # ------------------------------------------------------------- alert state
+    def _load_seen(self) -> Dict[str, str]:
+        try:
+            data = json.loads(self._seen_path.read_text())
+            # Drop entries from previous days so a stale fingerprint cannot
+            # suppress a genuine new setup tomorrow.
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if data.get("day") != today:
+                return {}
+            return data.get("fingerprints", {})
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _save_seen(self) -> None:
+        try:
+            self._seen_path.parent.mkdir(parents=True, exist_ok=True)
+            self._seen_path.write_text(json.dumps({
+                "day": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "fingerprints": self._seen,
+            }))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[screener] could not persist alert state: {exc}")
 
     # ------------------------------------------------------------------ model
     def _client_or_none(self):
@@ -501,4 +530,6 @@ class Screener:
                 continue
             self._seen[v.ticker] = fingerprint
             fresh.append(v)
+        if fresh:
+            self._save_seen()
         return fresh
