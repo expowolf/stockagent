@@ -1,0 +1,36 @@
+name: Kronos live data
+# Runs yfinance on GitHub's runners (which CAN reach Yahoo), commits the
+# results to data/live/. Claude reads them via raw.githubusercontent.com.
+# Free tier: unlimited on public repos, ~150 min/mo used out of 2000 free.
+
+on:
+  schedule:
+    # Every 15 min during US market hours (13:30-20:00 UTC, Mon-Fri).
+    # Cron drift on GitHub is 5-15 min during peak; not for scalping, fine for swing.
+    - cron: '*/15 13-20 * * 1-5'
+  workflow_dispatch: {}
+
+concurrency:
+  group: kronos-data
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install yfinance==0.2.40 pandas==2.2.2 pyarrow==16.1.0
+      - run: python kronos-scanner/backend/fetch_relay.py
+      - name: commit if changed
+        run: |
+          git config user.name  "kronos-data-bot"
+          git config user.email "kronos-data-bot@users.noreply.github.com"
+          git add data/live/
+          git diff --cached --quiet || git commit -m "data: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push

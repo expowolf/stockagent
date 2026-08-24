@@ -195,13 +195,31 @@ def load_universe(
     pause: float = 0.0,
     interval: str = "1d",
 ) -> dict:
-    """Load many tickers. Returns {ticker: DataFrame}. Failures are skipped."""
+    """Load many tickers. Returns {ticker: DataFrame}. Failures are skipped.
+
+    When KRONOS_RELAY_REPO is set and interval is daily, reads live daily bars
+    from the GitHub Actions relay first — a channel that reaches this sandbox
+    even when Yahoo direct does not.
+    """
     tickers = [str(t).upper() for t in tickers]
     out = {}
 
-    # Serve whatever is cached and fresh without touching the network.
+    if interval == "1d":
+        try:
+            from . import relay
+            if relay.configured():
+                relayed = relay.load_universe(tickers)
+                for t, df in relayed.items():
+                    out[t] = add_indicators(df)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ingestion] relay unavailable: {exc}")
+
+    # Serve whatever is cached and fresh without touching the network. Skip
+    # anything the relay already supplied above.
     need: list = []
     for t in tickers:
+        if t in out:
+            continue
         path = _cache_path(t, interval)
         if use_cache and _cache_usable(path, interval):
             try:
