@@ -9,6 +9,7 @@ venv/
 # Data cache
 **/_cache/
 *.parquet
+!data/live/*.parquet
 
 # Node / Next.js
 node_modules/
