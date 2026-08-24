@@ -22,18 +22,25 @@ kronos-scanner/
 └── docker-compose.yml          PostgreSQL + FastAPI
 ```
 
-## Quick start
+## Quick start — no API keys
 
-### Backend (local)
+Nothing here requires a signup. Yahoo Finance is keyless and is the primary
+data source; Alpaca and Alpha Vantage are optional fallbacks, and the Anthropic
+key only affects the optional confirmation tier. The strategy, risk gate,
+sizing, stops and alerts all run with zero keys.
 
 ```bash
-cd backend
-pip install -r requirements.txt
-uvicorn main:app --reload          # http://localhost:8000/docs
+./run.sh check        # 10-second data reachability test
+./run.sh              # one sweep of the universe
+./run.sh loop         # sweep every 15 minutes
+./run.sh AAPL,NVDA    # specific tickers
 ```
 
-The database is optional: if `DATABASE_URL` is unreachable the API still
-serves computed signals, it just skips persistence.
+Dependencies install themselves on first run.
+
+The one requirement is a host that can reach Yahoo. Sandboxed environments with
+a restrictive egress policy cannot, and the scan will say `NO DATA` and exit 2
+rather than inventing prices.
 
 ### Full stack (Docker)
 
