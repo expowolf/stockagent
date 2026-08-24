@@ -70,6 +70,10 @@ class EpisodicPivotStrategy(Strategy):
     MIN_DOLLAR_VOLUME = _f("EP_MIN_DOLLAR_VOLUME", 2_000_000)
     TARGET_R_MULTIPLE = _f("EP_TARGET_R", 3.0)
     STOP_ADR_MULT = _f("EP_STOP_ADR_MULT", 1.0)   # "stop no longer than ADR"
+    # A name whose ADR is below the account's risk-per-trade percent cannot
+    # ever carry the full risk budget — buying power caps the position first.
+    # Rejecting these here matches the strategy to what the account can size.
+    MIN_ADR_PCT = _f("EP_MIN_ADR_PCT", 0.03)
 
     # ------------------------------------------------------------------ gates
     def prefilter(self, ctx: MarketContext) -> bool:
@@ -81,6 +85,13 @@ class EpisodicPivotStrategy(Strategy):
         means never seeing it at all.
         """
         if ctx.dollar_volume is not None and ctx.dollar_volume < self.MIN_DOLLAR_VOLUME:
+            return False
+
+        # Untradeable-with-this-account filter. A mega-cap with 1% ADR can
+        # never carry a 4% risk budget on a small account: notional caps at
+        # 100% of cash before the trade is filled. Filtering here also nudges
+        # the surviving universe toward the small/mid caps the spec calls for.
+        if ctx.adr_pct is not None and ctx.adr_pct < self.MIN_ADR_PCT:
             return False
 
         # Setup A: a big up move on expanding volume.
