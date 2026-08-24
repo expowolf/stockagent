@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-      - run: pip install yfinance==0.2.40 pandas==2.2.2 pyarrow==16.1.0
+      - run: pip install --upgrade yfinance pandas pyarrow curl_cffi
       - run: python kronos-scanner/backend/fetch_relay.py
       - name: commit if changed
         run: |
