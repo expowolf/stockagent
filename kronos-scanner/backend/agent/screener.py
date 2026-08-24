@@ -28,6 +28,12 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import numpy as np
+import pandas as pd
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None
 
 from .budget import CreditGovernor, Tier, TIER_MODEL
 from .patterns import dedupe, detect, net_bias
@@ -86,13 +92,127 @@ class Verdict:
         return "\n".join(lines)
 
 
+def _session_fraction_elapsed(df, now=None) -> Optional[float]:
+    """
+    Fraction of today's regular session already traded, or None if the last bar
+    is not today (so the figure is final, not partial).
+
+    `now` is injectable so the partial-session path can be tested outside
+    market hours.
+    """
+    try:
+        from agent.schedule import MarketSession
+
+        sess = MarketSession()
+        now = now or sess.now()
+        last = pd.to_datetime(df["date"].iloc[-1]).date()
+        if last != now.date():
+            return None
+    except Exception:  # noqa: BLE001 - never let this break a scan
+        return None
+
+    # Regular US session is 390 minutes, 09:30-16:00 ET.
+    open_min = 9 * 60 + 30
+    et = now.astimezone(ZoneInfo("America/New_York")) if ZoneInfo else now
+    minutes = et.hour * 60 + et.minute - open_min
+    if minutes <= 0:
+        return None
+    # After the close this returns 1.0, i.e. the day's volume is final.
+    return min(1.0, minutes / 390.0)
+
+
 def _structure(df) -> dict:
-    """Cheap structural context: range position, ATR, RSI."""
+    """
+    Cheap structural context. All of this is pure numpy on the OHLCV frame and
+    costs nothing, which is what lets it run on every name in the universe.
+
+    Includes the Episodic-Pivot inputs: gap, volume expansion, average daily
+    range, prior neglect, and 1/3/6-month performance.
+    """
     close = df["close"].to_numpy(dtype=float)
     high = df["high"].to_numpy(dtype=float)
     low = df["low"].to_numpy(dtype=float)
+    open_ = df["open"].to_numpy(dtype=float)
+    volume = df["volume"].to_numpy(dtype=float) if "volume" in df.columns else None
 
     out: dict = {}
+
+    # --- today's move and gap -------------------------------------------
+    if len(close) >= 2:
+        prev_close = close[-2]
+        if prev_close > 0:
+            out["change_pct"] = (close[-1] - prev_close) / prev_close
+            out["gap_pct"] = (open_[-1] - prev_close) / prev_close
+
+    # --- volume expansion: the "10x average daily volume" test ----------
+    # Mid-session this needs care. Today's bar holds only the volume traded so
+    # far, and comparing a partial day against a FULL-day average understates
+    # the ratio badly: a genuine 10x pivot reads as 0.13x at 7:35am, so the
+    # test could never fire during the morning it exists to cover.
+    #
+    # Fix: divide by the fraction of a normal day expected to have traded by
+    # now. Volume is front-loaded rather than linear, approximated as
+    # f**0.6 — at 1.3% of the session that expects ~7% of daily volume, not
+    # 1.3%. Approximate by nature, so `volume_partial` flags when the number
+    # is a projection rather than a settled figure.
+    if volume is not None and len(volume) >= 51:
+        base = float(np.mean(volume[-51:-1]))
+        traded = float(volume[-1])
+
+        elapsed = _session_fraction_elapsed(df)
+        out["volume_partial"] = elapsed is not None and elapsed < 0.999
+        expected_frac = 1.0
+        if elapsed is not None and elapsed < 0.999:
+            expected_frac = max(float(elapsed) ** 0.7, 0.02)
+        out["session_elapsed"] = elapsed
+
+        if base > 0:
+            # Projected: what the full day looks like on track to be.
+            out["volume_ratio"] = traded / (base * expected_frac)
+            out["projected_volume"] = traded / expected_frac
+            # Raw: how much has ALREADY traded versus a normal FULL day. On a
+            # real pivot the surge is violently front-loaded rather than spread
+            # evenly, so by mid-morning this alone can exceed 1.0 — which is
+            # extraordinary on its own terms and needs no extrapolation.
+            out["volume_vs_full_day"] = traded / base
+        recent = float(np.mean(volume[-10:]))
+        out["volume_contraction"] = float(recent / base) if base > 0 else None
+        out["dollar_volume"] = float(traded * close[-1]) / expected_frac
+
+    # --- average daily range: the stop-width budget ---------------------
+    if len(close) >= 21:
+        rng = (high[-20:] - low[-20:]) / np.where(close[-20:] == 0, np.nan, close[-20:])
+        out["adr_pct"] = float(np.nanmean(rng))
+
+    # --- trailing performance (drives the top-1-2% ranking) -------------
+    for label, bars in (("perf_1m", 21), ("perf_3m", 63), ("perf_6m", 126)):
+        if len(close) > bars and close[-bars - 1] > 0:
+            out[label] = float((close[-1] - close[-bars - 1]) / close[-bars - 1])
+
+    # --- neglect / consolidation ----------------------------------------
+    # Measured EXCLUDING the current bar: a stock is "neglected" based on what
+    # it did BEFORE today's move, otherwise a big gap disqualifies itself.
+    if len(close) >= 61:
+        prior_h = float(np.max(high[-61:-1]))
+        prior_l = float(np.min(low[-61:-1]))
+        mid = (prior_h + prior_l) / 2.0
+        out["prior_range_pct"] = (prior_h - prior_l) / mid if mid > 0 else None
+
+        # NET change over the same prior window. Range alone cannot tell a
+        # sideways base from a steady climb: a stock grinding from 20 to 45
+        # shows only a modest 60-day range at any instant, yet it is exactly
+        # the "already been up for a bit" name the spec excludes. Range
+        # measures oscillation; this measures progress.
+        start = close[-61]
+        if start > 0:
+            out["prior_trend_pct"] = float((close[-2] - start) / start)
+
+        # Bars since the last >=10% daily move, again excluding today.
+        prior_close = close[:-1]
+        if len(prior_close) >= 2:
+            moves = np.abs(np.diff(prior_close) / np.where(prior_close[:-1] == 0, np.nan, prior_close[:-1]))
+            big = np.where(moves >= 0.10)[0]
+            out["bars_since_big_move"] = int(len(moves) - big[-1]) if len(big) else int(len(moves))
     if len(close) >= 20:
         win_h = float(np.max(high[-20:]))
         win_l = float(np.min(low[-20:]))
@@ -445,6 +565,23 @@ class Screener:
                 survivors.append((ticker, df, ctx))
             except Exception as exc:  # noqa: BLE001 - one bad name can't stop the sweep
                 print(f"[screener] {ticker} prefilter failed: {exc}")
+
+        # --- Rank across the universe (free) --------------------------------
+        # "Top 1-2% of stocks by upmove over 1, 3 and 6 months" is a RELATIVE
+        # test, so it cannot be answered one ticker at a time. Blend the three
+        # horizons, then convert to a percentile over everything scanned.
+        scored = []
+        for _t, _df, c in survivors:
+            horizons = [h for h in (c.perf_1m, c.perf_3m, c.perf_6m) if h is not None]
+            if horizons:
+                scored.append((c, sum(horizons) / len(horizons)))
+        if len(scored) >= 2:
+            scored.sort(key=lambda pair: pair[1])
+            last = len(scored) - 1
+            for i, (c, _v) in enumerate(scored):
+                c.perf_rank = i / last
+        elif scored:
+            scored[0][0].perf_rank = 1.0
 
         # --- Stage B: engines, then the full screen -------------------------
         for ticker, df, ctx in survivors:

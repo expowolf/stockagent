@@ -50,6 +50,25 @@ class MarketContext:
     pct_from_20d_low: Optional[float] = None
     atr_pct: Optional[float] = None        # ATR as fraction of price
     rsi_14: Optional[float] = None
+    # Episodic-Pivot inputs (all free, computed from OHLCV)
+    change_pct: Optional[float] = None       # today's move vs prior close
+    gap_pct: Optional[float] = None          # today's open vs prior close
+    volume_ratio: Optional[float] = None     # today's volume / 50d average
+    volume_contraction: Optional[float] = None  # 10d avg volume / 50d average
+    dollar_volume: Optional[float] = None    # liquidity screen
+    volume_partial: bool = False             # True when volume_ratio is a projection
+    session_elapsed: Optional[float] = None  # fraction of today's session traded
+    projected_volume: Optional[float] = None # today's volume extrapolated to a full day
+    volume_vs_full_day: Optional[float] = None  # traded so far / normal FULL day
+    adr_pct: Optional[float] = None          # average daily range -> stop budget
+    perf_1m: Optional[float] = None
+    perf_3m: Optional[float] = None
+    perf_6m: Optional[float] = None
+    prior_range_pct: Optional[float] = None  # 60d range BEFORE today (oscillation)
+    prior_trend_pct: Optional[float] = None  # 60d NET change BEFORE today (progress)
+    bars_since_big_move: Optional[int] = None
+    # Universe-relative rank, filled in by the screener (0..1, 1 = best)
+    perf_rank: Optional[float] = None
     # Yahoo Finance news (populated only for candidates; free unless analysed)
     news_impact: Optional[str] = None      # "bullish" | "bearish" | "neutral"
     news_magnitude: float = 0.0            # 0..1 expected near-term price impact
