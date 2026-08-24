@@ -18,7 +18,12 @@ CACHE_DIR = os.environ.get(
     "KRONOS_CACHE_DIR",
     os.path.join(os.path.dirname(__file__), "_cache"),
 )
-CACHE_TTL_HOURS = float(os.environ.get("KRONOS_CACHE_TTL_HOURS", "12"))
+# Deliberately short. A long TTL is dangerous for live scanning: cache written
+# in the evening would still count as "fresh" the next morning, so a scan would
+# analyse yesterday's candles and produce signals that look perfectly valid and
+# are a full day stale. Freshness is also validated against the DATA itself in
+# _cache_usable(), not just file mtime.
+CACHE_TTL_HOURS = float(os.environ.get("KRONOS_CACHE_TTL_HOURS", "1"))
 
 
 _CHAIN = None
@@ -52,6 +57,55 @@ def _cache_fresh(path: str) -> bool:
         return False
     age_hours = (time.time() - os.path.getmtime(path)) / 3600.0
     return age_hours < CACHE_TTL_HOURS
+
+
+def _last_expected_session(now_local=None) -> "date":
+    """
+    The most recent date that should appear in a daily series.
+
+    Before the open we expect the previous trading day; once the market has
+    opened we expect today. Weekends and holidays walk backwards.
+    """
+    from datetime import time as _time
+
+    from agent.schedule import MarketSession
+
+    sess = MarketSession()
+    now = now_local or sess.now()
+    d = now.date()
+
+    # Before today's open, today's bar does not exist yet.
+    if sess.is_trading_day(d) and now.time() >= _time(7, 30):
+        return d
+    for _ in range(1, 8):
+        d = d - timedelta(days=1)
+        if sess.is_trading_day(d):
+            return d
+    return d
+
+
+def _cache_usable(path: str, interval: str = "1d") -> bool:
+    """
+    Freshness by CONTENT, not just file age.
+
+    mtime alone is not enough: a file written last night is young by the clock
+    but its newest bar is yesterday's, which is exactly the stale-data trap for
+    a morning scan.
+    """
+    if not _cache_fresh(path):
+        return False
+    if interval != "1d":
+        return True  # intraday relies on the short TTL
+
+    try:
+        df = pd.read_parquet(path, columns=["date"])
+        if df.empty:
+            return False
+        last = pd.to_datetime(df["date"]).max().date()
+    except Exception:  # noqa: BLE001 - unreadable cache is unusable
+        return False
+
+    return last >= _last_expected_session()
 
 
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -111,7 +165,7 @@ def load_ticker(
     """
     path = _cache_path(ticker, interval)
 
-    if use_cache and _cache_fresh(path):
+    if use_cache and _cache_usable(path, interval):
         df = pd.read_parquet(path)
     else:
         # Ordered provider chain: yfinance first, Alpha Vantage as a
@@ -149,7 +203,7 @@ def load_universe(
     need: list = []
     for t in tickers:
         path = _cache_path(t, interval)
-        if use_cache and _cache_fresh(path):
+        if use_cache and _cache_usable(path, interval):
             try:
                 out[t] = add_indicators(pd.read_parquet(path))
                 continue
