@@ -262,40 +262,13 @@ def load_universe(
     return out
 
 
-# Default universe: liquid US large/mid caps across every major sector.
-# A trend strategy needs breadth — with only a handful of names most sweeps
-# find nothing, because at any moment only a small fraction of the market is
-# actually setting up. The funnel makes width cheap: patterns run at ~0.3ms a
-# name and token cost does not scale with universe size at all.
-#
-# Override wholesale with KRONOS_UNIVERSE="AAA,BBB,...".
-DEFAULT_UNIVERSE = [
-    # Mega-cap tech / comms
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "NFLX",
-    "AVGO", "ORCL", "CRM", "ADBE", "AMD", "INTC", "QCOM", "TXN",
-    "CSCO", "IBM", "NOW", "INTU", "AMAT", "MU", "LRCX", "KLAC",
-    "ADI", "SNPS", "CDNS", "PANW", "CRWD", "SNOW", "DDOG", "NET",
-    "SHOP", "UBER", "ABNB", "PLTR", "SQ", "PYPL", "COIN", "MRVL",
-    # Financials
-    "JPM", "BAC", "WFC", "GS", "MS", "C", "SCHW", "BLK",
-    "AXP", "V", "MA", "SPGI", "CB", "PGR", "USB", "PNC",
-    # Healthcare
-    "UNH", "JNJ", "LLY", "ABBV", "MRK", "PFE", "TMO", "ABT",
-    "DHR", "AMGN", "BMY", "GILD", "CVS", "ISRG", "VRTX", "REGN",
-    # Consumer
-    "WMT", "COST", "HD", "LOW", "TGT", "NKE", "SBUX", "MCD",
-    "KO", "PEP", "PG", "PM", "MDLZ", "CL", "KMB", "GIS",
-    "DIS", "CMCSA", "BKNG", "MAR", "CMG", "LULU", "TJX", "ROST",
-    # Industrials / transport
-    "CAT", "DE", "BA", "GE", "HON", "UNP", "UPS", "FDX",
-    "LMT", "RTX", "NOC", "GD", "MMM", "EMR", "ETN", "PH",
-    # Energy / materials
-    "XOM", "CVX", "COP", "SLB", "EOG", "PSX", "MPC", "VLO",
-    "OXY", "HAL", "DVN", "FCX", "NEM", "LIN", "APD", "NUE",
-    # Utilities / REITs / staples
-    "NEE", "DUK", "SO", "D", "AEP", "EXC", "SRE", "XEL",
-    "AMT", "PLD", "CCI", "EQIX", "SPG", "O", "PSA", "WELL",
-    # Liquid ETFs — useful regime context for a trend strategy
-    "SPY", "QQQ", "IWM", "DIA", "XLF", "XLK", "XLE", "XLV",
-    "XLI", "XLY", "XLP", "XLU", "SMH", "ARKK", "GLD", "TLT",
-]
+# Universes live in universes.py. Default is small/mid cap: the Episodic Pivot
+# cannot form in mega-caps, which are too widely held for the market to
+# reassess overnight.
+from .universes import (  # noqa: E402
+    DEFAULT_UNIVERSE,
+    ETFS,
+    FULL_UNIVERSE,
+    MEGA_CAP,
+    SMALL_MID,
+)
