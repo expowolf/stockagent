@@ -1,23 +1,24 @@
-name: Kronos live data
-# Fetches the universe AND runs the scan on GitHub's runners, which can reach
-# Yahoo. On a TAKE it opens a GitHub issue, and GitHub emails/pushes that to
-# the repo owner — so alerts do not depend on a Claude session being awake.
+name: Kronos routine
+# The agent's daily routine, run on GitHub's runners rather than in a Claude
+# session — in-session cron proved unreliable (three registrations, all
+# silently cleared while the session was still active), whereas this has fired
+# on schedule every time.
 #
-# This exists because in-session cron proved unreliable (three registrations,
-# all silently cleared while the session was still active), whereas this
-# workflow has fired on schedule every time.
+#   premarket   13:25 UTC   06:25 MT   data health before the open
+#   session     */15        07:30-14:00 MT  fetch, scan, alert, journal
+#   wrap        21:10 UTC   15:10 MT   mark outcomes, post the day's stats
 #
-# Free tier: unlimited on public repos, ~150 min/mo of the 2000 free otherwise.
+# Free tier: unlimited on public repos, ~200 min/mo of the 2000 free otherwise.
 
 on:
   schedule:
-    # Every 15 min during US market hours (13:30-20:00 UTC, Mon-Fri).
-    # GitHub cron drifts 5-15 min under load: fine for swing, not for scalping.
-    - cron: '*/15 13-20 * * 1-5'
+    - cron: '25 13 * * 1-5'        # premarket check
+    - cron: '*/15 13-20 * * 1-5'   # session sweeps
+    - cron: '10 21 * * 1-5'        # daily wrap
   workflow_dispatch: {}
 
 concurrency:
-  group: kronos-data
+  group: kronos-routine
   cancel-in-progress: false
 
 env:
@@ -27,7 +28,7 @@ env:
   KRONOS_TZ: America/Denver
 
 jobs:
-  scan:
+  routine:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -40,16 +41,20 @@ jobs:
           cache: pip
       - run: pip install --upgrade yfinance pandas numpy scipy hmmlearn pyarrow curl_cffi
 
+      # Which phase of the routine is this? The wrap cron fires at :10, the
+      # premarket one at :25 of hour 13; everything else is a session sweep.
+      - name: identify phase
+        id: phase
+        run: |
+          H=$(date -u +%H); M=$(date -u +%M)
+          if   [ "$H" = "21" ]; then P=wrap
+          elif [ "$H" = "13" ] && [ "$M" -ge 20 ] && [ "$M" -lt 30 ]; then P=premarket
+          else P=session; fi
+          echo "phase=$P" >> "$GITHUB_OUTPUT"
+          echo "Phase: $P ($(date -u +%H:%M) UTC)"
+
       - name: fetch universe
         run: python kronos-scanner/backend/fetch_relay.py
-
-      - name: commit data
-        run: |
-          git config user.name  "kronos-data-bot"
-          git config user.email "kronos-data-bot@users.noreply.github.com"
-          git add data/live/
-          git diff --cached --quiet || git commit -m "data: $(date -u +%Y-%m-%dT%H:%MZ)"
-          git push || true
 
       - name: scan
         id: scan
@@ -58,26 +63,31 @@ jobs:
           set +e
           python scan_cli.py --no-news --ignore-session > /tmp/scan.txt 2>&1
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
-          # Strip yfinance noise; keep the report and any ALERT lines.
           grep -viE 'warning|converg|^\[|Failed|Connection|delisted|possibly' /tmp/scan.txt \
             > /tmp/clean.txt || true
           tail -30 /tmp/clean.txt
-          # ALERT lines are what matter — they are the new TAKEs.
-          grep '^ALERT:' /tmp/clean.txt > /tmp/alerts.txt || true
-          echo "alert_count=$(wc -l < /tmp/alerts.txt)" >> "$GITHUB_OUTPUT"
-          {
-            echo 'report<<KRONOS_EOF'
-            tail -30 /tmp/clean.txt
-            echo 'KRONOS_EOF'
-          } >> "$GITHUB_OUTPUT"
-          {
-            echo 'alerts<<KRONOS_EOF'
-            cat /tmp/alerts.txt
-            echo 'KRONOS_EOF'
-          } >> "$GITHUB_OUTPUT"
+          grep '^ALERT:'  /tmp/clean.txt > /tmp/alerts.txt || true
+          grep '^CLOSED:' /tmp/clean.txt > /tmp/closed.txt || true
+          echo "alert_count=$(wc -l < /tmp/alerts.txt)"  >> "$GITHUB_OUTPUT"
+          echo "closed_count=$(wc -l < /tmp/closed.txt)" >> "$GITHUB_OUTPUT"
+          for n in report:/tmp/clean.txt alerts:/tmp/alerts.txt closed:/tmp/closed.txt; do
+            k=${n%%:*}; f=${n##*:}
+            { echo "$k<<KRONOS_EOF"; tail -30 "$f"; echo 'KRONOS_EOF'; } >> "$GITHUB_OUTPUT"
+          done
 
-      # An issue notifies the repo owner by email and GitHub mobile push. Only
-      # opened when there is a genuinely new TAKE, so a quiet market is silent.
+      # Commit AFTER the scan: the scan writes journal.json, so committing
+      # before it would persist the data but silently lose every outcome.
+      - name: commit data + journal
+        run: |
+          git config user.name  "kronos-bot"
+          git config user.email "kronos-bot@users.noreply.github.com"
+          git add data/live/
+          git diff --cached --quiet || git commit -m "kronos ${{ steps.phase.outputs.phase }}: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git pull --rebase -q || true
+          git push || true
+
+      # An issue emails and mobile-pushes the repo owner, so alerting does not
+      # depend on any Claude session being awake.
       - name: alert on TAKE
         if: steps.scan.outputs.alert_count != '0'
         uses: actions/github-script@v7
@@ -87,18 +97,32 @@ jobs:
             const report = `${{ steps.scan.outputs.report }}`.trim();
             const first = alerts.split('\n')[0].replace(/^ALERT:\s*/, '');
             await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: context.repo.owner, repo: context.repo.repo,
               title: `TAKE — ${first}`,
-              body: [
-                '## New setup', '```', alerts, '```',
-                '', '## Full scan', '```', report, '```',
-                '', `_${new Date().toISOString()} · Episodic Pivot · stop is in the alert line._`,
-              ].join('\n'),
+              body: ['## New setup','```',alerts,'```','',
+                     '## Scan','```',report,'```','',
+                     `_${new Date().toISOString()} · stop is in the alert line._`].join('\n'),
               labels: ['kronos-alert'],
+            });
+
+      - name: daily wrap
+        if: steps.phase.outputs.phase == 'wrap'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const report = `${{ steps.scan.outputs.report }}`.trim();
+            const closed = `${{ steps.scan.outputs.closed }}`.trim();
+            const day = new Date().toISOString().slice(0, 10);
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: `Kronos wrap — ${day}`,
+              body: ['## Closed today','```', closed || 'none','```','',
+                     '## End of day','```', report,'```','',
+                     '_Journal: data/live/journal.json — win rate and expectancy',
+                     'are unreliable below ~20 closed trades._'].join('\n'),
+              labels: ['kronos-wrap'],
             });
 
       - name: flag data failure
         if: steps.scan.outputs.exit_code == '2' || steps.scan.outputs.exit_code == '3'
-        run: |
-          echo "::warning::Kronos scan had a data problem (exit ${{ steps.scan.outputs.exit_code }})"
+        run: echo "::warning::Kronos data problem (exit ${{ steps.scan.outputs.exit_code }})"

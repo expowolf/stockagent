@@ -148,6 +148,25 @@ def main(argv=None) -> int:
     takes = [v for v in verdicts if v.decision == "TAKE"]
     snap = governor.snapshot()
 
+    # Journal: mark open positions against today's bars, then record new
+    # TAKEs. This is what turns a signal generator into something that can
+    # answer whether the edge is real.
+    journal_line = ""
+    try:
+        from agent.journal import Journal
+
+        jrnl = Journal()
+        just_closed = jrnl.update(data)
+        for v in verdicts:
+            if v.decision == "TAKE":
+                jrnl.record(v)
+        jrnl.save()
+        journal_line = jrnl.summary_line()
+        for e in just_closed:
+            print(f"CLOSED: {e.ticker} {e.status} {e.r_multiple:+.2f}R @ {e.exit_price:.2f}")
+    except Exception as exc:  # noqa: BLE001 - journal must never break a scan
+        print(f"[journal] skipped: {exc}")
+
     # Which TAKEs are genuinely new? Deduped across processes, so /loop will
     # not re-alert the same setup every five minutes.
     fresh = screener.new_takes(verdicts)
@@ -223,6 +242,8 @@ def main(argv=None) -> int:
     paid = sum(1 for v in verdicts if v.tier != "none")
     tail = f"cost: {paid} paid call(s), {snap['spent_tokens']:,} tokens used this window"
     tail += f" · {len(fresh)} new alert(s)"
+    if journal_line:
+        tail += f"\n{journal_line}"
     if want_notify:
         tail += f" ({pushed} via ntfy)"
     print(tail)
