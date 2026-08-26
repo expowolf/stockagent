@@ -27,7 +27,7 @@ sys.path.insert(0, str(HERE))
 from data.ingestion import DEFAULT_UNIVERSE  # noqa: E402
 
 
-def fetch(tickers: list, period: str = "6mo") -> dict:
+def fetch(tickers: list, period: str = "2y") -> dict:
     """yf.download batches — 150 tickers is a couple of requests."""
     frames: dict = {}
     for i in range(0, len(tickers), 50):
