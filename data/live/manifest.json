@@ -1,6 +1,6 @@
 {
-  "fetched_at": "2026-08-26T14:09:16+00:00",
-  "loaded": 295,
+  "fetched_at": "2026-08-26T14:26:51+00:00",
+  "loaded": 296,
   "requested": 335,
   "missing": [
     "ACCD",
@@ -36,7 +36,6 @@
     "SNCY",
     "SWN",
     "SWTX",
-    "TEVA",
     "TRUE",
     "UDMY",
     "VERV",
@@ -299,6 +298,7 @@
     "SYNA",
     "TALO",
     "TDOC",
+    "TEVA",
     "TGTX",
     "TLT",
     "TLYS",
