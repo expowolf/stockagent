@@ -1,0 +1,40 @@
+name: Research run
+# Walk-forward evaluation of SPY/QQQ intraday setups on GitHub's runners,
+# which can reach Yahoo. Results post to an issue.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install --upgrade yfinance pandas numpy curl_cffi
+
+      - name: run
+        id: r
+        working-directory: kronos-scanner/backend/research
+        run: |
+          set +e
+          python run.py > /tmp/out.txt 2>&1
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          grep -viE 'FutureWarning|DeprecationWarning|^\s*$|warnings\.warn|^  [a-z_]+ =' /tmp/out.txt > /tmp/c.txt || true
+          cat /tmp/c.txt
+          { echo 'out<<EOF'; tail -90 /tmp/c.txt; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: `SPY/QQQ research — ${new Date().toISOString().slice(0,10)}`,
+              body: ['```', `${{ steps.r.outputs.out }}`.trim(), '```'].join('\n'),
+              labels: ['kronos-research'],
+            });
