@@ -10,11 +10,13 @@ name: Kronos routine
 #
 # Free tier: unlimited on public repos, ~200 min/mo of the 2000 free otherwise.
 
+# PAUSED — superseded by qqq-bot.yml. The user wants index signals, not
+# Episodic Pivots. Uncomment to bring the stock scanner back.
 on:
-  schedule:
-    - cron: '25 13 * * 1-5'        # 06:25 MT premarket check
-    - cron: '*/15 13-20 * * 1-5'   # 07:30-14:00 MT session sweeps
-    - cron: '10 21 * * 1-5'        # 15:10 MT daily wrap
+  # schedule:
+  #   - cron: '25 13 * * 1-5'
+  #   - cron: '*/15 13-20 * * 1-5'
+  #   - cron: '10 21 * * 1-5'
   workflow_dispatch: {}
 
 concurrency:

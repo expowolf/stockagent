@@ -1,0 +1,78 @@
+name: QQQ bot
+# Live VWAP-pullback signals for QQQ/SPY during the regular session.
+# Alerts post as GitHub issues, which email and mobile-push the repo owner,
+# so nothing depends on a Claude session being awake.
+#
+# Cadence: every 10 minutes. The bot re-checks the last few CLOSED bars each
+# run, so a 10-minute cadence on 5-minute bars misses no signal — it only
+# delays the alert. Every 5 minutes would roughly double Actions usage for a
+# marginal latency gain.
+
+on:
+  schedule:
+    - cron: '*/10 13-20 * * 1-5'   # 07:30-14:00 MT, regular session
+  workflow_dispatch: {}
+
+concurrency:
+  group: qqq-bot
+  cancel-in-progress: false
+
+env:
+  KRONOS_ACCOUNT_SIZE: '570'
+  KRONOS_RISK_PER_TRADE: '0.005'   # 0.5% base, per the user's own risk spec
+  KRONOS_DAILY_LOSS: '0.02'
+  KRONOS_MAX_CONSEC_LOSSES: '3'
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install --upgrade yfinance pandas numpy curl_cffi
+
+      - name: scan
+        id: s
+        working-directory: kronos-scanner/backend/research
+        run: |
+          set +e
+          python qqq_bot.py > /tmp/o.txt 2>&1
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          grep -viE 'FutureWarning|DeprecationWarning|warnings\.warn|^\s*$' /tmp/o.txt > /tmp/c.txt || true
+          cat /tmp/c.txt
+          grep -c '^ALERT:' /tmp/c.txt > /tmp/n.txt || echo 0 > /tmp/n.txt
+          echo "n=$(cat /tmp/n.txt)" >> "$GITHUB_OUTPUT"
+          { echo 'out<<EOF'; tail -40 /tmp/c.txt; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+
+      - name: persist state
+        run: |
+          git config user.name  "kronos-bot"
+          git config user.email "kronos-bot@users.noreply.github.com"
+          git add data/live/qqq_bot.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "qqq bot: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git pull --rebase -q || true
+          git push || true
+
+      - name: alert
+        if: steps.s.outputs.n != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const out = `${{ steps.s.outputs.out }}`.trim();
+            const first = (out.split('\n').find(l => l.startsWith('ALERT:')) || 'signal')
+                            .replace(/^ALERT:\s*/, '');
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: `${first}`,
+              body: ['```', out, '```', '',
+                     '**Flat by the close — no overnight hold.**', '',
+                     '_VWAP pullback. Expectancy measured at +0.02 to +0.04R,',
+                     'which is inside the noise band — size stays at 0.5%._'].join('\n'),
+              labels: ['qqq-signal'],
+            });
