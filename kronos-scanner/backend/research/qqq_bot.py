@@ -54,6 +54,15 @@ STOP_ATR = 1.2
 TARGET_R = 2.5
 LOOKBACK_BARS = 4          # re-check recent bars so a 10-min cadence misses nothing
 
+# A stop tighter than this is inside the spread and ordinary tick noise. On a
+# quiet 5-minute bar ATR can fall to ~0.4 on SPY, which produces a 49c stop —
+# about 0.06% of price, against ~3c of round-trip cost. That is not a trade,
+# it is a coin flip paying a toll.
+MIN_STOP_PCT = float(os.environ.get("KRONOS_MIN_STOP_PCT", "0.0015"))   # 0.15%
+# When buying power caps the position this hard, realized risk collapses far
+# below target and costs dominate. Reject rather than issue an unplayable fill.
+MIN_RISK_FRACTION = float(os.environ.get("KRONOS_MIN_RISK_FRACTION", "0.5"))
+
 ACCOUNT = float(os.environ.get("KRONOS_ACCOUNT_SIZE", "570"))
 RISK_PCT = float(os.environ.get("KRONOS_RISK_PER_TRADE", "0.005"))   # 0.5% base
 RISK_PCT_MAX = float(os.environ.get("KRONOS_RISK_MAX", "0.01"))      # 1.0% cap
@@ -172,6 +181,13 @@ def main() -> int:
 
             entry = f["o"][t + 1] if t + 1 <= last else f["c"][t]
             risk_per_share = atr * STOP_ATR
+
+            # Floor the stop. ATR alone is not enough on a quiet tape.
+            floor = entry * MIN_STOP_PCT
+            if risk_per_share < floor:
+                print(f"  skip {tk}: stop {risk_per_share:.2f} inside noise "
+                      f"(floor {floor:.2f} = {MIN_STOP_PCT*100:.2f}% of price)")
+                continue
             stop = entry - risk_per_share if sig > 0 else entry + risk_per_share
             target = entry + risk_per_share * TARGET_R if sig > 0 else entry - risk_per_share * TARGET_R
 
@@ -181,6 +197,12 @@ def main() -> int:
             if notional > ACCOUNT:
                 shares = round(ACCOUNT / entry, 4)
                 notional = shares * entry
+
+            realized_risk = shares * risk_per_share
+            if realized_risk < dollar_risk * MIN_RISK_FRACTION:
+                print(f"  skip {tk}: buying power caps risk at ${realized_risk:.2f} "
+                      f"vs ${dollar_risk:.2f} target — costs would dominate")
+                continue
 
             side = "LONG" if sig > 0 else "SHORT"
             print(f"\nALERT: {side} {tk} @ {entry:.2f} · stop {stop:.2f} · "
@@ -203,3 +225,5 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 # run: 17:40:33Z
+
+# run: 17:48:43Z
