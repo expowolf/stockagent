@@ -23,8 +23,8 @@ RULES
                 the correct side of session VWAP.
     Entry       Price pulls back to touch VWAP or the 9 EMA, then closes back
                 in the direction of the trend. Fill at the NEXT bar's open.
-    Stop        1.2 x ATR(14).
-    Target      2.5R.
+    Stop        0.50% of entry — a fixed percentage, not ATR.
+    Target      2.5R (1.25%).
     Exit        Flat by the close. No overnight risk.
     Size        Account risk / stop distance. Never the reverse.
 
@@ -50,18 +50,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from engine import build, regime, TREND_DN, TREND_UP  # noqa: E402
 
 TICKERS = ["QQQ", "SPY"]
-STOP_ATR = 1.2
-TARGET_R = 2.5
+# Percentage stops, not ATR. ATR collapses on a quiet tape and produced a 49c
+# stop on SPY that the spread could cross — a coin flip paying a toll.
+#
+# 0.5% is also the number the account arithmetic forces. Fully deployed,
+# notional = account, so realized risk = account x stop%. With risk set at
+# 0.5%, a 0.5% stop is exactly the point where a capped position still carries
+# the intended dollar risk. Anything tighter under-risks; anything wider
+# over-deploys.
+STOP_PCT = float(os.environ.get("KRONOS_STOP_PCT", "0.005"))    # 0.50%
+TARGET_R = 2.5                                                   # -> 1.25% target
 LOOKBACK_BARS = 4          # re-check recent bars so a 10-min cadence misses nothing
-
-# A stop tighter than this is inside the spread and ordinary tick noise. On a
-# quiet 5-minute bar ATR can fall to ~0.4 on SPY, which produces a 49c stop —
-# about 0.06% of price, against ~3c of round-trip cost. That is not a trade,
-# it is a coin flip paying a toll.
-MIN_STOP_PCT = float(os.environ.get("KRONOS_MIN_STOP_PCT", "0.0015"))   # 0.15%
-# When buying power caps the position this hard, realized risk collapses far
-# below target and costs dominate. Reject rather than issue an unplayable fill.
-MIN_RISK_FRACTION = float(os.environ.get("KRONOS_MIN_RISK_FRACTION", "0.5"))
 
 ACCOUNT = float(os.environ.get("KRONOS_ACCOUNT_SIZE", "570"))
 RISK_PCT = float(os.environ.get("KRONOS_RISK_PER_TRADE", "0.005"))   # 0.5% base
@@ -148,7 +147,8 @@ def main() -> int:
 
     print(f"QQQ/SPY VWAP-pullback bot · {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC")
     print(f"account ${ACCOUNT:,.0f} · risk {RISK_PCT*100:.2f}%/trade "
-          f"(${ACCOUNT*RISK_PCT:.2f}) · stop {STOP_ATR}xATR · target {TARGET_R}R")
+          f"(${ACCOUNT*RISK_PCT:.2f}) · stop {STOP_PCT*100:.2f}% · "
+          f"target {TARGET_R}R ({STOP_PCT*TARGET_R*100:.2f}%)")
 
     if stop_reason:
         print(f"HALTED: {stop_reason}")
@@ -175,19 +175,8 @@ def main() -> int:
             if key in state["alerted"]:
                 continue
 
-            atr = f["atr"][t]
-            if not np.isfinite(atr) or atr <= 0:
-                continue
-
             entry = f["o"][t + 1] if t + 1 <= last else f["c"][t]
-            risk_per_share = atr * STOP_ATR
-
-            # Floor the stop. ATR alone is not enough on a quiet tape.
-            floor = entry * MIN_STOP_PCT
-            if risk_per_share < floor:
-                print(f"  skip {tk}: stop {risk_per_share:.2f} inside noise "
-                      f"(floor {floor:.2f} = {MIN_STOP_PCT*100:.2f}% of price)")
-                continue
+            risk_per_share = entry * STOP_PCT
             stop = entry - risk_per_share if sig > 0 else entry + risk_per_share
             target = entry + risk_per_share * TARGET_R if sig > 0 else entry - risk_per_share * TARGET_R
 
@@ -198,18 +187,13 @@ def main() -> int:
                 shares = round(ACCOUNT / entry, 4)
                 notional = shares * entry
 
-            realized_risk = shares * risk_per_share
-            if realized_risk < dollar_risk * MIN_RISK_FRACTION:
-                print(f"  skip {tk}: buying power caps risk at ${realized_risk:.2f} "
-                      f"vs ${dollar_risk:.2f} target — costs would dominate")
-                continue
 
             side = "LONG" if sig > 0 else "SHORT"
             print(f"\nALERT: {side} {tk} @ {entry:.2f} · stop {stop:.2f} · "
                   f"target {target:.2f} · {shares:g}sh (${notional:,.0f}) · "
                   f"risk ${shares*risk_per_share:.2f}")
             print(f"       bar {f['idx'][t]:%H:%M} ET · regime {regime(f, t)} · "
-                  f"ATR {atr:.2f} · R:R {TARGET_R}:1 · FLAT BY CLOSE")
+                  f"stop {STOP_PCT*100:.2f}% · R:R {TARGET_R}:1 · FLAT BY CLOSE")
             state["alerted"].append(key)
             found += 1
 
