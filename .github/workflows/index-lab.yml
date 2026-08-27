@@ -1,0 +1,43 @@
+name: Index lab
+# One-off research run: backtests candidate QQQ/SPY intraday strategies on
+# GitHub's runners, which can reach Yahoo. Results land in an issue.
+#
+# Manual only — this is research, not the live loop.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install --upgrade yfinance pandas numpy curl_cffi
+
+      - name: run lab
+        id: lab
+        working-directory: kronos-scanner/backend
+        run: |
+          set +e
+          python index_lab.py > /tmp/lab.txt 2>&1
+          grep -viE 'warning|^\[|Failed|delisted|possibly|FutureWarning' /tmp/lab.txt > /tmp/clean.txt || true
+          cat /tmp/clean.txt
+          { echo 'out<<LAB_EOF'; tail -60 /tmp/clean.txt; echo 'LAB_EOF'; } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: `Index lab — QQQ/SPY candidates ${new Date().toISOString().slice(0,10)}`,
+              body: ['## Backtest results','```',`${{ steps.lab.outputs.out }}`.trim(),'```','',
+                     '_One window, in-sample. Positive avg R here is necessary but not',
+                     'sufficient — regimes change._'].join('\n'),
+              labels: ['kronos-research'],
+            });
