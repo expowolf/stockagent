@@ -25,6 +25,7 @@ RULES
                 in the direction of the trend. Fill at the NEXT bar's open.
     Stop        0.50% of entry — a fixed percentage, not ATR.
     Target      2.5R (1.25%).
+    Window      Entries only between 09:45 and 15:00 ET, today's bars only.
     Exit        Flat by the close. No overnight risk.
     Size        Account risk / stop distance. Never the reverse.
 
@@ -41,6 +42,9 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")
 
 import numpy as np
 import pandas as pd
@@ -61,6 +65,16 @@ TICKERS = ["QQQ", "SPY"]
 STOP_PCT = float(os.environ.get("KRONOS_STOP_PCT", "0.005"))    # 0.50%
 TARGET_R = 2.5                                                   # -> 1.25% target
 LOOKBACK_BARS = 4          # re-check recent bars so a 10-min cadence misses nothing
+
+# Session VWAP resets at the open, so on the first bar of the day VWAP IS that
+# bar's own typical price — "price touched VWAP and closed above it" is then
+# nearly tautological. Wait until VWAP is an average of something.
+MIN_BAR_OF_DAY = 3         # 15 minutes in
+
+# Exit is flat-by-close, so a 1.25% target needs room to be reached. A signal
+# at 15:50 gets two bars and then a forced market exit: that is not the trade
+# that was measured, it is a coin flip that pays the spread.
+LAST_ENTRY_MINUTE = 15 * 60     # 15:00 ET
 
 ACCOUNT = float(os.environ.get("KRONOS_ACCOUNT_SIZE", "570"))
 RISK_PCT = float(os.environ.get("KRONOS_RISK_PER_TRADE", "0.005"))   # 0.5% base
@@ -93,6 +107,10 @@ def load(ticker: str):
 
 def signal_at(f, t) -> int:
     """VWAP pullback, evaluated on a CLOSED bar. Returns +1 / -1 / 0."""
+    if f["bar_of_day"][t] < MIN_BAR_OF_DAY:
+        return 0
+    if f["minute"][t] >= LAST_ENTRY_MINUTE:
+        return 0
     r = regime(f, t)
     if r not in TREND_UP | TREND_DN:
         return 0
@@ -113,7 +131,9 @@ def read_state() -> dict:
         s = json.loads(STATE.read_text())
     except Exception:  # noqa: BLE001
         s = {}
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Anchor the day to ET, not UTC. A UTC rollover lands at 20:00 ET, which
+    # is a different day from the session it is supposed to bookend.
+    today = datetime.now(ET).strftime("%Y-%m-%d")
     if s.get("day") != today:
         # New session: reset the daily counters but keep nothing stale.
         s = {"day": today, "alerted": [], "realized_r": 0.0, "consec_losses": 0}
@@ -155,6 +175,12 @@ def main() -> int:
         print("No new signals will be issued today.")
         return 0
 
+    # Only today's bars are tradeable. The lookback window reaches back a few
+    # bars, and the alert ledger resets each session — without this, the first
+    # run after the open would re-issue yesterday's closing signals as if they
+    # were live, on a position that was supposed to be flat by that close.
+    session_date = datetime.now(ET).date()
+
     found = 0
     for tk in TICKERS:
         df = load(tk)
@@ -168,6 +194,8 @@ def main() -> int:
         # so it is deliberately excluded — acting on a partial bar is acting on
         # a number that has not happened yet.
         for t in range(max(210, last - LOOKBACK_BARS), last):
+            if f["idx"][t].date() != session_date:
+                continue
             sig = signal_at(f, t)
             if sig == 0:
                 continue
