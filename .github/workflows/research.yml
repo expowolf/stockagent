@@ -4,6 +4,12 @@ name: Research run
 
 on:
   workflow_dispatch: {}
+  # Also run when the research code changes. The API token available here
+  # cannot dispatch workflows, so a push is the trigger that actually works.
+  push:
+    paths:
+      - 'kronos-scanner/backend/research/**'
+      - '.github/workflows/research.yml'
 
 jobs:
   research:
