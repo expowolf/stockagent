@@ -75,4 +75,6 @@ jobs:
                      '_VWAP pullback. Expectancy measured at +0.02 to +0.04R,',
                      'which is inside the noise band — size stays at 0.5%._'].join('\n'),
               labels: ['qqq-signal'],
+              // Assignment notifies unconditionally; watching the repo does not.
+              assignees: [context.repo.owner],
             });

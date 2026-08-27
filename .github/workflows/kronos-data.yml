@@ -105,6 +105,7 @@ jobs:
                      '## Scan','```',report,'```','',
                      `_${new Date().toISOString()} · stop is in the alert line._`].join('\n'),
               labels: ['kronos-alert'],
+              assignees: [context.repo.owner],
             });
 
       - name: daily wrap
@@ -123,6 +124,7 @@ jobs:
                      '_Journal: data/live/journal.json — win rate and expectancy',
                      'are unreliable below ~20 closed trades._'].join('\n'),
               labels: ['kronos-wrap'],
+              assignees: [context.repo.owner],
             });
 
       - name: flag data failure
