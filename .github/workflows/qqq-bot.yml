@@ -10,7 +10,16 @@ name: QQQ bot
 
 on:
   schedule:
-    - cron: '*/10 13-20 * * 1-5'   # 07:30-14:00 MT, regular session
+    # Offset minutes, not */10. Round minutes (:00, :10, :20...) are the most
+    # contended slots on GitHub's scheduler and the ones it drops first under
+    # load. This workflow has been registered on the default branch since
+    # 04:15 UTC and fired ZERO of its ~40 scheduled slots today, while the
+    # older routine on the same repo fired 36 times — consistently 15-30
+    # minutes late. Delay is tolerable here; being dropped is not.
+    - cron: '2,12,22,32,42,52 13-20 * * 1-5'   # 07:30-14:00 MT, regular session
+    # Temporary: proves the scheduler actually fires this workflow. Remove
+    # once a scheduled run is on the record.
+    - cron: '4,9,14 21 * * *'
   workflow_dispatch: {}
   # Push trigger: the token here cannot dispatch workflows, so this is the
   # only way to force an on-demand run.
