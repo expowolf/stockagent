@@ -10,14 +10,11 @@ name: Kronos routine
 #
 # Free tier: unlimited on public repos, ~200 min/mo of the 2000 free otherwise.
 
-# PAUSED. The schedule below is commented out at the user's request, so the
-# agent no longer wakes on its own. Everything still works — press "Run
-# workflow" in the Actions tab for a one-off scan, and uncomment to resume.
 on:
-  # schedule:
-  #   - cron: '25 13 * * 1-5'        # premarket check
-  #   - cron: '*/15 13-20 * * 1-5'   # session sweeps
-  #   - cron: '10 21 * * 1-5'        # daily wrap
+  schedule:
+    - cron: '25 13 * * 1-5'        # 06:25 MT premarket check
+    - cron: '*/15 13-20 * * 1-5'   # 07:30-14:00 MT session sweeps
+    - cron: '10 21 * * 1-5'        # 15:10 MT daily wrap
   workflow_dispatch: {}
 
 concurrency:
