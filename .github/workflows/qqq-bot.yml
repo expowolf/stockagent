@@ -12,6 +12,12 @@ on:
   schedule:
     - cron: '*/10 13-20 * * 1-5'   # 07:30-14:00 MT, regular session
   workflow_dispatch: {}
+  # Push trigger: the token here cannot dispatch workflows, so this is the
+  # only way to force an on-demand run.
+  push:
+    paths:
+      - 'kronos-scanner/backend/research/qqq_bot.py'
+      - '.github/workflows/qqq-bot.yml'
 
 concurrency:
   group: qqq-bot
