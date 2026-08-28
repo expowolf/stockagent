@@ -32,6 +32,11 @@ on:
     paths:
       - 'kronos-scanner/backend/research/qqq_bot.py'
       - '.github/workflows/qqq-bot.yml'
+      # The morning kick. A scheduled Claude routine writes a timestamp here
+      # at 13:22 UTC and pushes, which starts the session job in seconds —
+      # the one trigger path on this repo that has never been late. Kept
+      # separate from the bot source so a daily kick is not a code change.
+      - '.github/kick'
 
 # A running session job must not be interrupted, and a backstop sweep must not
 # run beside it and double-alert.
