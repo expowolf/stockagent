@@ -42,7 +42,14 @@ on:
 # run beside it and double-alert.
 concurrency:
   group: qqq-bot
-  cancel-in-progress: false
+  # A push supersedes a running job; anything else queues behind it.
+  #
+  # This is the only kill switch available: both workflow_dispatch and the
+  # runs/cancel API return 403 for this token, so when a live session job is
+  # misbehaving, a push is the sole way to replace it. Cron backstops must
+  # NOT cancel — a sweep landing mid-morning would otherwise kill the very
+  # session job it exists to back up.
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   KRONOS_ACCOUNT_SIZE: '570'
