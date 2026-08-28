@@ -81,7 +81,13 @@ LAST_ENTRY_MINUTE = 15 * 60     # 15:00 ET
 # to fire twenty-one separate runs.
 LOOP = os.environ.get("KRONOS_LOOP", "") not in ("", "0", "false")
 SLEEP = int(os.environ.get("KRONOS_SLEEP", "300"))
-LOOP_END = os.environ.get("KRONOS_LOOP_END", "15:05")   # ET, matches the cutoff
+# Watch until the actual bell, not until the entry cutoff. Entries stop at
+# 15:00, but a position opened at 14:55 still resolves during the last hour —
+# and a job that stopped watching at 15:05 would book it "flat" when it had
+# really hit its stop or target. Those recorded outcomes are the only evidence
+# that will ever say whether this edge is real, so systematically truncating
+# them would quietly bias the very number being measured.
+LOOP_END = os.environ.get("KRONOS_LOOP_END", "16:05")   # ET, just past the close
 
 ACCOUNT = float(os.environ.get("KRONOS_ACCOUNT_SIZE", "570"))
 RISK_PCT = float(os.environ.get("KRONOS_RISK_PER_TRADE", "0.005"))   # 0.5% base

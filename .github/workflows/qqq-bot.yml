@@ -68,6 +68,15 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Check out the BRANCH TIP, not the SHA that triggered this run.
+          #
+          # A push-triggered job otherwise gets the pushed commit, which can
+          # predate the alert ledger a previous job committed seconds earlier.
+          # That is exactly what happened on 2026-08-28: a restart read a
+          # state file from before the running bot had saved its alerts and
+          # re-issued a signal the user had already been notified about.
+          ref: ${{ github.ref_name }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
