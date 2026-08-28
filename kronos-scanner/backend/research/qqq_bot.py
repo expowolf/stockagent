@@ -40,11 +40,11 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
-
-ET = ZoneInfo("America/New_York")
 
 import numpy as np
 import pandas as pd
@@ -53,6 +53,7 @@ import yfinance as yf
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from engine import build, regime, TREND_DN, TREND_UP  # noqa: E402
 
+ET = ZoneInfo("America/New_York")
 TICKERS = ["QQQ", "SPY"]
 # Percentage stops, not ATR. ATR collapses on a quiet tape and produced a 49c
 # stop on SPY that the spread could cross — a coin flip paying a toll.
@@ -75,6 +76,12 @@ MIN_BAR_OF_DAY = 3         # 15 minutes in
 # at 15:50 gets two bars and then a forced market exit: that is not the trade
 # that was measured, it is a coin flip that pays the spread.
 LAST_ENTRY_MINUTE = 15 * 60     # 15:00 ET
+
+# Loop mode: stay alive for the session instead of relying on the scheduler
+# to fire twenty-one separate runs.
+LOOP = os.environ.get("KRONOS_LOOP", "") not in ("", "0", "false")
+SLEEP = int(os.environ.get("KRONOS_SLEEP", "300"))
+LOOP_END = os.environ.get("KRONOS_LOOP_END", "15:05")   # ET, matches the cutoff
 
 ACCOUNT = float(os.environ.get("KRONOS_ACCOUNT_SIZE", "570"))
 RISK_PCT = float(os.environ.get("KRONOS_RISK_PER_TRADE", "0.005"))   # 0.5% base
@@ -161,20 +168,42 @@ def halted(s: dict) -> str:
     return ""
 
 
-def main() -> int:
-    state = read_state()
-    stop_reason = halted(state)
+def post_issue(title: str, body: str) -> None:
+    """
+    Post the alert from inside the bot, not from a later workflow step.
 
-    print(f"QQQ/SPY VWAP-pullback bot · {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC")
-    print(f"account ${ACCOUNT:,.0f} · risk {RISK_PCT*100:.2f}%/trade "
-          f"(${ACCOUNT*RISK_PCT:.2f}) · stop {STOP_PCT*100:.2f}% · "
-          f"target {TARGET_R}R ({STOP_PCT*TARGET_R*100:.2f}%)")
+    In loop mode the process lives for the whole session, so an alert that
+    waits for the job to finish would reach the phone hours after the setup
+    was tradeable. A late alert on an intraday signal is not a degraded
+    alert, it is a wrong one.
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    owner = os.environ.get("GITHUB_REPOSITORY_OWNER")
+    if not (token and repo):
+        print("[bot] no GITHUB_TOKEN/REPOSITORY — alert printed only")
+        return
+    payload = json.dumps({
+        "title": title, "body": body, "labels": ["qqq-signal"],
+        # Assignment notifies unconditionally; watching the repo does not.
+        "assignees": [owner] if owner else [],
+    }).encode()
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/issues", data=payload,
+        headers={"Authorization": f"Bearer {token}",
+                 "Accept": "application/vnd.github+json",
+                 "Content-Type": "application/json",
+                 "User-Agent": "kronos-bot"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            print(f"[bot] alert posted: issue #{json.load(r)['number']}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bot] alert POST failed: {exc}")
 
-    if stop_reason:
-        print(f"HALTED: {stop_reason}")
-        print("No new signals will be issued today.")
-        return 0
 
+def sweep(state: dict) -> int:
+    """One pass over both tickers. Returns the number of new alerts."""
     # Only today's bars are tradeable. The lookback window reaches back a few
     # bars, and the alert ledger resets each session — without this, the first
     # run after the open would re-issue yesterday's closing signals as if they
@@ -183,7 +212,14 @@ def main() -> int:
 
     found = 0
     for tk in TICKERS:
-        df = load(tk)
+        try:
+            df = load(tk)
+        except Exception as exc:  # noqa: BLE001
+            # One bad fetch must not end the session. The loop is the whole
+            # day's coverage; killing it over a transient Yahoo error would
+            # cost every remaining setup.
+            print(f"{tk}: fetch failed ({exc})")
+            continue
         if df is None:
             print(f"{tk}: no data")
             continue
@@ -206,30 +242,84 @@ def main() -> int:
             entry = f["o"][t + 1] if t + 1 <= last else f["c"][t]
             risk_per_share = entry * STOP_PCT
             stop = entry - risk_per_share if sig > 0 else entry + risk_per_share
-            target = entry + risk_per_share * TARGET_R if sig > 0 else entry - risk_per_share * TARGET_R
+            target = (entry + risk_per_share * TARGET_R if sig > 0
+                      else entry - risk_per_share * TARGET_R)
 
-            dollar_risk = ACCOUNT * RISK_PCT
-            shares = round(dollar_risk / risk_per_share, 4)
-            notional = shares * entry
-            if notional > ACCOUNT:
+            shares = round(ACCOUNT * RISK_PCT / risk_per_share, 4)
+            if shares * entry > ACCOUNT:      # buying-power cap
                 shares = round(ACCOUNT / entry, 4)
-                notional = shares * entry
-
+            notional = shares * entry
 
             side = "LONG" if sig > 0 else "SHORT"
-            print(f"\nALERT: {side} {tk} @ {entry:.2f} · stop {stop:.2f} · "
-                  f"target {target:.2f} · {shares:g}sh (${notional:,.0f}) · "
-                  f"risk ${shares*risk_per_share:.2f}")
-            print(f"       bar {f['idx'][t]:%H:%M} ET · regime {regime(f, t)} · "
-                  f"stop {STOP_PCT*100:.2f}% · R:R {TARGET_R}:1 · FLAT BY CLOSE")
+            head = (f"{side} {tk} @ {entry:.2f} · stop {stop:.2f} · "
+                    f"target {target:.2f} · {shares:g}sh (${notional:,.0f}) · "
+                    f"risk ${shares*risk_per_share:.2f}")
+            detail = (f"bar {f['idx'][t]:%H:%M} ET · regime {regime(f, t)} · "
+                      f"stop {STOP_PCT*100:.2f}% · R:R {TARGET_R}:1 · "
+                      f"FLAT BY CLOSE")
+            print(f"\nALERT: {head}\n       {detail}")
             state["alerted"].append(key)
+            write_state(state)
+            post_issue(head, "\n".join([
+                "```", f"ALERT: {head}", f"       {detail}", "```", "",
+                "**Flat by the close — no overnight hold.**", "",
+                "_VWAP pullback. Expectancy measured at +0.02 to +0.04R,_",
+                "_which is inside the noise band — size stays at 0.5%._",
+            ]))
             found += 1
+    return found
 
-    if not found:
-        print("\nNo setups on closed bars.")
+
+def main() -> int:
+    state = read_state()
+
+    print(f"QQQ/SPY VWAP-pullback bot · {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC")
+    print(f"account ${ACCOUNT:,.0f} · risk {RISK_PCT*100:.2f}%/trade "
+          f"(${ACCOUNT*RISK_PCT:.2f}) · stop {STOP_PCT*100:.2f}% · "
+          f"target {TARGET_R}R ({STOP_PCT*TARGET_R*100:.2f}%)")
+
+    stop_reason = halted(state)
+    if stop_reason:
+        print(f"HALTED: {stop_reason}")
+        print("No new signals will be issued today.")
+        return 0
+
+    if not LOOP:
+        found = sweep(state)
+        if not found:
+            print("\nNo setups on closed bars.")
+        write_state(state)
+        print(f"\nday P&L {state['realized_r']:+.2f}R · consec losses "
+              f"{state['consec_losses']} · alerts today {len(state['alerted'])}")
+        return 0
+
+    # Loop mode: one job covers the whole session.
+    #
+    # Workflow dispatch returns 403 for this token, so the only triggers are
+    # cron and push — and cron fired zero of roughly forty slots the day this
+    # was written. Twenty-one scheduled runs are twenty-one chances to be
+    # dropped; one long-lived job needs the scheduler to work exactly once.
+    end_h, end_m = (int(x) for x in LOOP_END.split(":"))
+    stop_at = datetime.now(ET).replace(hour=end_h, minute=end_m,
+                                       second=0, microsecond=0)
+    print(f"LOOP until {stop_at:%H:%M} ET, every {SLEEP}s\n")
+
+    total = 0
+    while datetime.now(ET) < stop_at:
+        try:
+            total += sweep(state)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bot] sweep failed, continuing: {exc}")
+        left = (stop_at - datetime.now(ET)).total_seconds()
+        if left <= 0:
+            break
+        print(f"[{datetime.now(ET):%H:%M} ET] alerts today {len(state['alerted'])} "
+              f"· {left/60:.0f} min left", flush=True)
+        time.sleep(min(SLEEP, left))
+
     write_state(state)
-    print(f"\nday P&L {state['realized_r']:+.2f}R · consec losses "
-          f"{state['consec_losses']} · alerts today {len(state['alerted'])}")
+    print(f"\nSession done. {total} alert(s) this run · "
+          f"{len(state['alerted'])} today · day P&L {state['realized_r']:+.2f}R")
     return 0
 
 

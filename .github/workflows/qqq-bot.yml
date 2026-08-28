@@ -3,23 +3,28 @@ name: QQQ bot
 # Alerts post as GitHub issues, which email and mobile-push the repo owner,
 # so nothing depends on a Claude session being awake.
 #
-# Cadence: every 10 minutes. The bot re-checks the last few CLOSED bars each
-# run, so a 10-minute cadence on 5-minute bars misses no signal — it only
-# delays the alert. Every 5 minutes would roughly double Actions usage for a
-# marginal latency gain.
+# WHY ONE LONG JOB INSTEAD OF TWENTY-ONE SHORT ONES
+#   workflow_dispatch returns 403 for the token available here, so the only
+#   triggers are cron and push. On the day this was written the schedule fired
+#   ZERO of its ~40 slots, while an older workflow in the same repo had 36
+#   scheduled runs on record — every one of them 15-30 minutes late. GitHub's
+#   scheduler sheds load, and a 10-minute cadence turns that into twenty-one
+#   independent chances to be dropped.
+#
+#   The bot now loops internally for the session and posts each alert itself as
+#   it happens, so the scheduler only has to work ONCE, at the open. The sweep
+#   crons below are a backstop: if the session job never started, they still
+#   catch setups one pass at a time.
 
 on:
   schedule:
-    # Offset minutes, not */10. Round minutes (:00, :10, :20...) are the most
-    # contended slots on GitHub's scheduler and the ones it drops first under
-    # load. This workflow has been registered on the default branch since
-    # 04:15 UTC and fired ZERO of its ~40 scheduled slots today, while the
-    # older routine on the same repo fired 36 times — consistently 15-30
-    # minutes late. Delay is tolerable here; being dropped is not.
-    - cron: '2,12,22,32,42,52 13-20 * * 1-5'   # 07:30-14:00 MT, regular session
-    # Temporary: proves the scheduler actually fires this workflow. Remove
-    # once a scheduled run is on the record.
-    - cron: '4,9,14 21 * * *'
+    # Start the session-long job. Two attempts, ~09:23 and ~09:38 ET, because a
+    # dropped start is the one failure the loop design cannot absorb. The
+    # second is a no-op if the first is already running (see concurrency).
+    - cron: '23 13 * * 1-5'
+    - cron: '38 13 * * 1-5'
+    # Backstop sweeps, on offset rather than contended round minutes.
+    - cron: '7,27,47 14-19 * * 1-5'
   workflow_dispatch: {}
   # Push trigger: the token here cannot dispatch workflows, so this is the
   # only way to force an on-demand run.
@@ -28,6 +33,8 @@ on:
       - 'kronos-scanner/backend/research/qqq_bot.py'
       - '.github/workflows/qqq-bot.yml'
 
+# A running session job must not be interrupted, and a backstop sweep must not
+# run beside it and double-alert.
 concurrency:
   group: qqq-bot
   cancel-in-progress: false
@@ -41,6 +48,9 @@ env:
 jobs:
   bot:
     runs-on: ubuntu-latest
+    # The session job exits at 15:05 ET. Ample headroom, plus a hard ceiling so
+    # a hung fetch cannot burn the whole 6-hour job limit.
+    timeout-minutes: 400
     permissions:
       contents: write
       issues: write
@@ -52,20 +62,37 @@ jobs:
           cache: pip
       - run: pip install --upgrade yfinance pandas numpy curl_cffi
 
-      - name: scan
-        id: s
-        working-directory: kronos-scanner/backend/research
+      # Mode is decided by the CLOCK, not by which trigger fired.
+      #
+      # GitHub's scheduler delivered a probe cron EIGHT HOURS late on this
+      # repo, so cron cannot be the thing that starts the session. Anything
+      # that reaches the runner during market hours should start the session
+      # job instead — a push, a dispatch, a very late cron. Whichever arrives
+      # first wins; concurrency keeps the rest from running beside it.
+      - name: decide mode
+        id: m
         run: |
-          set +e
-          python qqq_bot.py > /tmp/o.txt 2>&1
-          echo "code=$?" >> "$GITHUB_OUTPUT"
-          grep -viE 'FutureWarning|DeprecationWarning|warnings\.warn|^\s*$' /tmp/o.txt > /tmp/c.txt || true
-          cat /tmp/c.txt
-          grep -c '^ALERT:' /tmp/c.txt > /tmp/n.txt || echo 0 > /tmp/n.txt
-          echo "n=$(cat /tmp/n.txt)" >> "$GITHUB_OUTPUT"
-          { echo 'out<<EOF'; tail -40 /tmp/c.txt; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+          H=$(date -u +%H); D=$(date -u +%u)
+          if [ "$D" -le 5 ] && [ "$H" -ge 13 ] && [ "$H" -lt 19 ]; then
+            echo "loop=1" >> "$GITHUB_OUTPUT"
+            echo "session job: looping until 15:05 ET"
+          else
+            echo "loop=" >> "$GITHUB_OUTPUT"
+            echo "outside market hours: single pass"
+          fi
+          echo "event=${{ github.event_name }} at $(date -u +%H:%M) UTC"
+
+      - name: scan
+        env:
+          KRONOS_LOOP: ${{ steps.m.outputs.loop }}
+          # The bot posts its own alerts, in real time. A workflow step could
+          # only post once the job ended — hours late on an intraday signal.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: kronos-scanner/backend/research
+        run: python qqq_bot.py
 
       - name: persist state
+        if: always()
         run: |
           git config user.name  "kronos-bot"
           git config user.email "kronos-bot@users.noreply.github.com"
@@ -73,23 +100,3 @@ jobs:
           git diff --cached --quiet || git commit -m "qqq bot: $(date -u +%Y-%m-%dT%H:%MZ)"
           git pull --rebase -q || true
           git push || true
-
-      - name: alert
-        if: steps.s.outputs.n != '0'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const out = `${{ steps.s.outputs.out }}`.trim();
-            const first = (out.split('\n').find(l => l.startsWith('ALERT:')) || 'signal')
-                            .replace(/^ALERT:\s*/, '');
-            await github.rest.issues.create({
-              owner: context.repo.owner, repo: context.repo.repo,
-              title: `${first}`,
-              body: ['```', out, '```', '',
-                     '**Flat by the close — no overnight hold.**', '',
-                     '_VWAP pullback. Expectancy measured at +0.02 to +0.04R,',
-                     'which is inside the noise band — size stays at 0.5%._'].join('\n'),
-              labels: ['qqq-signal'],
-              // Assignment notifies unconditionally; watching the repo does not.
-              assignees: [context.repo.owner],
-            });
