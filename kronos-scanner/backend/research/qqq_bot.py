@@ -143,11 +143,63 @@ def read_state() -> dict:
     today = datetime.now(ET).strftime("%Y-%m-%d")
     if s.get("day") != today:
         # New session: reset the daily counters but keep nothing stale.
-        s = {"day": today, "alerted": [], "realized_r": 0.0, "consec_losses": 0}
+        s = {"day": today, "alerted": [], "realized_r": 0.0,
+             "consec_losses": 0, "open": None}
     s.setdefault("alerted", [])
     s.setdefault("realized_r", 0.0)
     s.setdefault("consec_losses", 0)
+    s.setdefault("open", None)
     return s
+
+
+def resolve_open(state: dict, tk: str, f: dict) -> None:
+    """
+    Mark the open signal against bars that printed after its entry.
+
+    Stop is checked BEFORE target. When one 5-minute bar spans both levels the
+    data cannot say which came first, and assuming the favourable order is the
+    single biggest way a strategy flatters itself.
+
+    This is also what finally makes the circuit breakers real: consec_losses
+    and realized_r could never increment while nothing recorded an outcome.
+    """
+    op = state.get("open")
+    if not op or op["ticker"] != tk:
+        return
+
+    long = op["side"] == "LONG"
+    for i in range(f["n"]):
+        if f["idx"][i].isoformat() <= op["entry_bar"]:
+            continue
+        hi, lo = f["h"][i], f["l"][i]
+        hit_stop = lo <= op["stop"] if long else hi >= op["stop"]
+        hit_target = hi >= op["target"] if long else lo <= op["target"]
+        if hit_stop:
+            close_open(state, -1.0, f"stopped at {op['stop']:.2f}")
+            return
+        if hit_target:
+            close_open(state, TARGET_R, f"target {op['target']:.2f} hit")
+            return
+
+
+def close_open(state: dict, r: float, why: str) -> None:
+    op = state["open"]
+    state["realized_r"] += r
+    state["consec_losses"] = 0 if r > 0 else state["consec_losses"] + 1
+    print(f"[bot] CLOSED {op['side']} {op['ticker']} — {why} · {r:+.2f}R "
+          f"· day {state['realized_r']:+.2f}R")
+    post_issue(
+        f"CLOSED {op['side']} {op['ticker']} · {r:+.2f}R · {why}",
+        "\n".join([
+            f"Entry {op['entry']:.2f} · stop {op['stop']:.2f} · "
+            f"target {op['target']:.2f}", "",
+            f"Result **{r:+.2f}R** ({why}).", "",
+            f"_Day: {state['realized_r']:+.2f}R · "
+            f"consecutive losses {state['consec_losses']}._",
+            "_Stop is checked before target: when one bar spans both, the_",
+            "_data cannot say which came first, so the loss is assumed._",
+        ]))
+    state["open"] = None
 
 
 def write_state(s: dict) -> None:
@@ -226,6 +278,21 @@ def sweep(state: dict) -> int:
         f = build(df)
         last = f["n"] - 1
 
+        # Settle any open signal on this ticker before considering a new one.
+        resolve_open(state, tk, f)
+
+        # ONE POSITION AT A TIME.
+        #
+        # Every signal sizes to the full $570 — notional equals the account,
+        # because SPY at $771 against $570 is a fraction of a share and the
+        # buying-power cap binds on essentially every trade. So two live
+        # signals are not two trades, they are the same money twice. The bot
+        # has no broker connection and cannot see fills, so the only honest
+        # discipline is to issue nothing further until the outstanding signal
+        # has resolved.
+        if state.get("open"):
+            continue
+
         # Re-check the last few CLOSED bars. The newest bar is still forming,
         # so it is deliberately excluded — acting on a partial bar is acting on
         # a number that has not happened yet.
@@ -259,6 +326,11 @@ def sweep(state: dict) -> int:
                       f"FLAT BY CLOSE")
             print(f"\nALERT: {head}\n       {detail}")
             state["alerted"].append(key)
+            state["open"] = {
+                "ticker": tk, "side": side, "entry": float(entry),
+                "stop": float(stop), "target": float(target),
+                "entry_bar": f["idx"][t].isoformat(),
+            }
             write_state(state)
             post_issue(head, "\n".join([
                 "```", f"ALERT: {head}", f"       {detail}", "```", "",
@@ -267,6 +339,7 @@ def sweep(state: dict) -> int:
                 "_which is inside the noise band — size stays at 0.5%._",
             ]))
             found += 1
+            break     # one position at a time — stop scanning this ticker
     return found
 
 
@@ -316,6 +389,28 @@ def main() -> int:
         print(f"[{datetime.now(ET):%H:%M} ET] alerts today {len(state['alerted'])} "
               f"· {left/60:.0f} min left", flush=True)
         time.sleep(min(SLEEP, left))
+
+    # The rule is flat by the close, so nothing may carry overnight. The exit
+    # price is whatever the close was, which this process cannot know without
+    # another fetch — so the position is cleared and left OUT of realized_r
+    # rather than booked as a fabricated 0R. A made-up outcome would corrupt
+    # the very statistics being gathered to judge whether the edge is real.
+    if state.get("open"):
+        op = state["open"]
+        print(f"[bot] flat by close: {op['side']} {op['ticker']} from "
+              f"{op['entry']:.2f} — outcome not measured")
+        post_issue(
+            f"FLAT BY CLOSE · {op['side']} {op['ticker']} from {op['entry']:.2f}",
+            "\n".join([
+                "Position closes at the bell per the rule. It hit neither "
+                "stop nor target during the session.", "",
+                f"Entry {op['entry']:.2f} · stop {op['stop']:.2f} · "
+                f"target {op['target']:.2f}", "",
+                "_Left out of the day's R total: the exit price is the close,_",
+                "_which this run cannot read, and inventing a number would_",
+                "_corrupt the statistics being gathered to test the edge._",
+            ]))
+        state["open"] = None
 
     write_state(state)
     print(f"\nSession done. {total} alert(s) this run · "
