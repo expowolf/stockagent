@@ -19,6 +19,8 @@ WHAT THIS IS, HONESTLY
     sizing and circuit breakers, not from conviction.
 
 RULES
+    Direction   LONG ONLY. The account cannot short, so downtrends are stood
+                aside from rather than traded.
     Regime      ADX >= 18 with a stacked EMA structure (9/21/50) and price on
                 the correct side of session VWAP.
     Entry       Price pulls back to touch VWAP or the 9 EMA, then closes back
@@ -71,6 +73,12 @@ LOOKBACK_BARS = 4          # re-check recent bars so a 10-min cadence misses not
 # bar's own typical price — "price touched VWAP and closed above it" is then
 # nearly tautological. Wait until VWAP is an average of something.
 MIN_BAR_OF_DAY = 3         # 15 minutes in
+
+# LONG ONLY. The account is cash at Fidelity with no short capability, so a
+# short signal is not a trade the user can take — it is noise arriving as a
+# phone notification during market hours. Five of seven signals on 2026-08-28
+# were shorts, every one of them unusable.
+LONG_ONLY = os.environ.get("KRONOS_LONG_ONLY", "1") not in ("0", "false", "")
 
 # Exit is flat-by-close, so a 1.25% target needs room to be reached. A signal
 # at 15:50 gets two bars and then a forced market exit: that is not the trade
@@ -126,6 +134,11 @@ def signal_at(f, t) -> int:
         return 0
     r = regime(f, t)
     if r not in TREND_UP | TREND_DN:
+        return 0
+    # The account cannot short. A downtrend is therefore not a trade, it is a
+    # reason to stand aside — rejected here, before any sizing or alerting, so
+    # a short cannot reach the phone by any path.
+    if LONG_ONLY and r in TREND_DN:
         return 0
     touched = (f["l"][t] <= f["vwap"][t] <= f["h"][t]) or \
               (f["l"][t] <= f["e9"][t] <= f["h"][t])
