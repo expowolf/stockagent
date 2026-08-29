@@ -4,9 +4,9 @@ name: Kronos routine
 # silently cleared while the session was still active), whereas this has fired
 # on schedule every time.
 #
-#   premarket   13:25 UTC   06:25 MT   data health before the open
-#   session     */15        07:30-14:00 MT  fetch, scan, alert, journal
-#   wrap        21:10 UTC   15:10 MT   mark outcomes, post the day's stats
+#   premarket   13:25 UTC   08:25 CT   data health before the open
+#   session     */15        08:30-15:00 CT  fetch, scan, alert, journal
+#   wrap        21:10 UTC   16:10 CT   mark outcomes, post the day's stats
 #
 # Free tier: unlimited on public repos, ~200 min/mo of the 2000 free otherwise.
 
@@ -27,7 +27,7 @@ env:
   KRONOS_STRATEGY: agent.strategies.episodic_pivot:EpisodicPivotStrategy
   KRONOS_ACCOUNT_SIZE: '570'
   KRONOS_RISK_PER_TRADE: '0.04'
-  KRONOS_TZ: America/Denver
+  KRONOS_TZ: America/Chicago
 
 jobs:
   routine:
