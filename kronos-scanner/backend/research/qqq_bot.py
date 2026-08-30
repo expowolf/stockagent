@@ -439,7 +439,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-# run: 17:40:33Z
-
-# run: 17:48:43Z
