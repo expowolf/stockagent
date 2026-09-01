@@ -16,15 +16,14 @@ name: QQQ bot
 #   crons below are a backstop: if the session job never started, they still
 #   catch setups one pass at a time.
 
+# PAUSED at the user's request (2026-08-30): the VWAP-pullback strategy is
+# being replaced. The bot must not alert until a new strategy is defined.
+# Uncomment the schedule to bring it back.
 on:
-  schedule:
-    # Start the session-long job. Two attempts, ~09:23 and ~09:38 ET, because a
-    # dropped start is the one failure the loop design cannot absorb. The
-    # second is a no-op if the first is already running (see concurrency).
-    - cron: '23 13 * * 1-5'
-    - cron: '38 13 * * 1-5'
-    # Backstop sweeps, on offset rather than contended round minutes.
-    - cron: '7,27,47 14-19 * * 1-5'
+  # schedule:
+  #   - cron: '23 13 * * 1-5'
+  #   - cron: '38 13 * * 1-5'
+  #   - cron: '7,27,47 14-19 * * 1-5'
   workflow_dispatch: {}
   # Push trigger: the token here cannot dispatch workflows, so this is the
   # only way to force an on-demand run.
@@ -32,11 +31,9 @@ on:
     paths:
       - 'kronos-scanner/backend/research/qqq_bot.py'
       - '.github/workflows/qqq-bot.yml'
-      # The morning kick. A scheduled Claude routine writes a timestamp here
-      # at 13:22 UTC and pushes, which starts the session job in seconds —
-      # the one trigger path on this repo that has never been late. Kept
-      # separate from the bot source so a daily kick is not a code change.
-      - '.github/kick'
+      # '.github/kick' is deliberately NOT listed while the bot is paused.
+      # The 08:22 CT routine still fires and still pushes that file; leaving
+      # it wired would restart the very bot this pause is meant to silence.
 
 # A running session job must not be interrupted, and a backstop sweep must not
 # run beside it and double-alert.
