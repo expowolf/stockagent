@@ -459,3 +459,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# Manual session run started 2026-09-02 12:27 ET at the user's request.
+# Schedule stays paused; this push is the deliberate trigger.
