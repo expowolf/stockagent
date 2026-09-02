@@ -97,6 +97,10 @@ SLEEP = int(os.environ.get("KRONOS_SLEEP", "300"))
 # them would quietly bias the very number being measured.
 LOOP_END = os.environ.get("KRONOS_LOOP_END", "16:05")   # ET, just past the close
 
+# Data source: "tv" reads the desktop TradingView relay, anything else Yahoo.
+DATA_SOURCE = os.environ.get("KRONOS_DATA_SOURCE", "yahoo").lower()
+TV_TIMEFRAME = os.environ.get("KRONOS_TV_TF", "5")
+
 ACCOUNT = float(os.environ.get("KRONOS_ACCOUNT_SIZE", "570"))
 RISK_PCT = float(os.environ.get("KRONOS_RISK_PER_TRADE", "0.005"))   # 0.5% base
 RISK_PCT_MAX = float(os.environ.get("KRONOS_RISK_MAX", "0.01"))      # 1.0% cap
@@ -110,6 +114,22 @@ STATE = Path(os.environ.get(
 
 
 def load(ticker: str):
+    """
+    Bars for one ticker, from whichever source is configured.
+
+    KRONOS_DATA_SOURCE=tv reads the desktop TradingView relay; anything else
+    falls back to Yahoo. Both return the identical contract — tz-aware ET
+    index, open/high/low/close/volume, regular session only — so the strategy
+    never learns where its bars came from.
+
+    A stale relay is deliberately allowed to raise rather than being caught
+    here: sweep() logs it per-ticker and keeps the session alive, and the one
+    outcome worth avoiding is a signal computed on a dead feed's old bars.
+    """
+    if DATA_SOURCE == "tv":
+        from tv_source import load_tv     # local import: Yahoo runs need no relay
+        return load_tv(ticker, timeframe=TV_TIMEFRAME)
+
     df = yf.download(ticker, period="5d", interval="5m",
                      auto_adjust=True, progress=False, threads=False)
     if df is None or df.empty:
