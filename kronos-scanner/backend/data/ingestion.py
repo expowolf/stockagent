@@ -1,0 +1,274 @@
+# data/ingestion.py
+"""yfinance loader with on-disk parquet caching and indicator computation."""
+
+import os
+import time
+from datetime import datetime, timedelta
+from typing import Iterable, Optional
+
+import numpy as np
+import pandas as pd
+
+try:
+    import yfinance as yf
+except ImportError:  # pragma: no cover
+    yf = None
+
+CACHE_DIR = os.environ.get(
+    "KRONOS_CACHE_DIR",
+    os.path.join(os.path.dirname(__file__), "_cache"),
+)
+# Deliberately short. A long TTL is dangerous for live scanning: cache written
+# in the evening would still count as "fresh" the next morning, so a scan would
+# analyse yesterday's candles and produce signals that look perfectly valid and
+# are a full day stale. Freshness is also validated against the DATA itself in
+# _cache_usable(), not just file mtime.
+CACHE_TTL_HOURS = float(os.environ.get("KRONOS_CACHE_TTL_HOURS", "1"))
+
+
+_CHAIN = None
+
+
+def _chain():
+    """Lazily build the shared provider chain."""
+    global _CHAIN
+    if _CHAIN is None:
+        from .providers import ProviderChain
+
+        _CHAIN = ProviderChain()
+    return _CHAIN
+
+
+def provider_status() -> dict:
+    """Which providers are configured, and Alpha Vantage quota remaining."""
+    return _chain().status()
+
+
+def _cache_path(ticker: str, interval: str = "1d") -> str:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    # Interval is part of the key: intraday bars must never be served from a
+    # daily cache entry, or a 1m scan silently gets yesterday's daily candles.
+    suffix = "" if interval == "1d" else f".{interval}"
+    return os.path.join(CACHE_DIR, f"{ticker.upper()}{suffix}.parquet")
+
+
+def _cache_fresh(path: str) -> bool:
+    if not os.path.exists(path):
+        return False
+    age_hours = (time.time() - os.path.getmtime(path)) / 3600.0
+    return age_hours < CACHE_TTL_HOURS
+
+
+def _last_expected_session(now_local=None) -> "date":
+    """
+    The most recent date that should appear in a daily series.
+
+    Before the open we expect the previous trading day; once the market has
+    opened we expect today. Weekends and holidays walk backwards.
+    """
+    from datetime import time as _time
+
+    from agent.schedule import MarketSession
+
+    sess = MarketSession()
+    now = now_local or sess.now()
+    d = now.date()
+
+    # Before today's open, today's bar does not exist yet.
+    if sess.is_trading_day(d) and now.time() >= _time(7, 30):
+        return d
+    for _ in range(1, 8):
+        d = d - timedelta(days=1)
+        if sess.is_trading_day(d):
+            return d
+    return d
+
+
+def _cache_usable(path: str, interval: str = "1d") -> bool:
+    """
+    Freshness by CONTENT, not just file age.
+
+    mtime alone is not enough: a file written last night is young by the clock
+    but its newest bar is yesterday's, which is exactly the stale-data trap for
+    a morning scan.
+    """
+    if not _cache_fresh(path):
+        return False
+    if interval != "1d":
+        return True  # intraday relies on the short TTL
+
+    try:
+        df = pd.read_parquet(path, columns=["date"])
+        if df.empty:
+            return False
+        last = pd.to_datetime(df["date"]).max().date()
+    except Exception:  # noqa: BLE001 - unreadable cache is unusable
+        return False
+
+    return last >= _last_expected_session()
+
+
+def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder's RSI."""
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return rsi.fillna(50.0)
+
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add sma_20, sma_50, rsi_14 columns to an OHLCV frame."""
+    df = df.copy()
+    df["sma_20"] = df["close"].rolling(20).mean()
+    df["sma_50"] = df["close"].rolling(50).mean()
+    df["rsi_14"] = compute_rsi(df["close"], 14)
+    return df
+
+
+def _normalize(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Normalize a yfinance frame to lowercase OHLCV with a `date` column."""
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    # yfinance can return a column MultiIndex for single tickers in some versions.
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw = raw.xs(ticker, axis=1, level=-1) if ticker in raw.columns.get_level_values(-1) else raw.droplevel(-1, axis=1)
+
+    raw = raw.rename(columns=str.lower).reset_index()
+    raw = raw.rename(columns={"index": "date", "datetime": "date"})
+    if "date" not in raw.columns and "Date" in raw.columns:
+        raw = raw.rename(columns={"Date": "date"})
+
+    keep = ["date", "open", "high", "low", "close", "volume"]
+    raw = raw[[c for c in keep if c in raw.columns]]
+    raw["ticker"] = ticker.upper()
+    raw = raw.dropna(subset=["close"])
+    return raw
+
+
+def load_ticker(
+    ticker: str,
+    period: str = "2y",
+    use_cache: bool = True,
+    with_indicators: bool = True,
+    interval: str = "1d",
+) -> pd.DataFrame:
+    """
+    Load a single ticker's daily OHLCV history.
+
+    Returns a DataFrame with columns:
+    [ticker, date, open, high, low, close, volume, sma_20, sma_50, rsi_14].
+    """
+    path = _cache_path(ticker, interval)
+
+    if use_cache and _cache_usable(path, interval):
+        df = pd.read_parquet(path)
+    else:
+        # Ordered provider chain: yfinance first, Alpha Vantage as a
+        # short-list fallback when yfinance is down.
+        from .providers import ProviderError
+
+        try:
+            df = _chain().fetch(ticker, period=period, interval=interval)
+        except ProviderError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        if not df.empty and use_cache:
+            df.to_parquet(path, index=False)
+
+    if df.empty:
+        return df
+
+    if with_indicators:
+        df = add_indicators(df)
+    return df
+
+
+def load_universe(
+    tickers: Iterable[str],
+    period: str = "2y",
+    use_cache: bool = True,
+    pause: float = 0.0,
+    interval: str = "1d",
+) -> dict:
+    """Load many tickers. Returns {ticker: DataFrame}. Failures are skipped.
+
+    When KRONOS_RELAY_REPO is set and interval is daily, reads live daily bars
+    from the GitHub Actions relay first — a channel that reaches this sandbox
+    even when Yahoo direct does not.
+    """
+    tickers = [str(t).upper() for t in tickers]
+    out = {}
+
+    if interval == "1d":
+        try:
+            from . import relay
+            if relay.configured():
+                relayed = relay.load_universe(tickers)
+                for t, df in relayed.items():
+                    out[t] = add_indicators(df)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ingestion] relay unavailable: {exc}")
+
+    # Serve whatever is cached and fresh without touching the network. Skip
+    # anything the relay already supplied above.
+    need: list = []
+    for t in tickers:
+        if t in out:
+            continue
+        path = _cache_path(t, interval)
+        if use_cache and _cache_usable(path, interval):
+            try:
+                out[t] = add_indicators(pd.read_parquet(path))
+                continue
+            except Exception:  # noqa: BLE001 - corrupt cache entry, refetch
+                pass
+        need.append(t)
+
+    # Batch-fetch the rest where the provider supports it (Alpaca does), which
+    # turns a 160-request sweep into about two.
+    if need:
+        try:
+            fetched = _chain().fetch_many(need, period=period, interval=interval)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ingestion] batch fetch failed, falling back per-ticker: {exc}")
+            fetched = {}
+
+        for t, df in fetched.items():
+            if df is None or df.empty:
+                continue
+            if use_cache:
+                try:
+                    df.to_parquet(_cache_path(t, interval), index=False)
+                except Exception:  # noqa: BLE001
+                    pass
+            out[t] = add_indicators(df)
+
+        need = [t for t in need if t not in out]
+
+    for t in need:
+        try:
+            df = load_ticker(t, period=period, use_cache=use_cache, interval=interval)
+            if not df.empty:
+                out[t.upper()] = df
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ingestion] failed to load {t}: {exc}")
+        if pause:
+            time.sleep(pause)
+    return out
+
+
+# Universes live in universes.py. Default is small/mid cap: the Episodic Pivot
+# cannot form in mega-caps, which are too widely held for the market to
+# reassess overnight.
+from .universes import (  # noqa: E402
+    DEFAULT_UNIVERSE,
+    ETFS,
+    FULL_UNIVERSE,
+    MEGA_CAP,
+    SMALL_MID,
+)

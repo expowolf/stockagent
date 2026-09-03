@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kronos
+      POSTGRES_PASSWORD: kronos
+      POSTGRES_DB: kronos
+    ports:
+      - "5432:5432"
+    volumes:
+      - kronos_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kronos"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg2://kronos:kronos@db:5432/kronos
+      KRONOS_CACHE_DIR: /app/data/_cache
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      NTFY_TOPIC: ${NTFY_TOPIC:-}
+      NTFY_SERVER: ${NTFY_SERVER:-https://ntfy.sh}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - kronos_cache:/app/data/_cache
+
+volumes:
+  kronos_pgdata:
+  kronos_cache:
