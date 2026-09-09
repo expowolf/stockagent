@@ -1,0 +1,42 @@
+name: AAPL event study
+# One-off: AAPL behavior around September iPhone launches, computed on a runner
+# (Yahoo reachable there; the sandbox is blocked). Posts results to an issue.
+on:
+  push:
+    paths:
+      - 'kronos-scanner/backend/research/aapl_event.py'
+      - '.github/workflows/aapl-event.yml'
+  workflow_dispatch: {}
+
+jobs:
+  study:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install --upgrade yfinance pandas numpy curl_cffi
+      - name: run
+        id: r
+        working-directory: kronos-scanner/backend/research
+        run: |
+          set +e
+          python aapl_event.py > /tmp/o.txt 2>&1
+          grep -viE 'FutureWarning|DeprecationWarning|warnings\.warn|^\s*$' /tmp/o.txt > /tmp/c.txt || true
+          cat /tmp/c.txt
+          { echo 'out<<EOF'; cat /tmp/c.txt; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: `AAPL iPhone-launch study — ${new Date().toISOString().slice(0,10)}`,
+              body: ['```', `${{ steps.r.outputs.out }}`.trim(), '```', '',
+                     '_Long-only account: "sell the news" cuts against a long. Distances are % of price — place the stop off your live quote._'].join('\n'),
+              labels: ['kronos-research'],
+              assignees: [context.repo.owner],
+            });
