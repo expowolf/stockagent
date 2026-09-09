@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - 'kronos-scanner/backend/research/aapl_event.py'
+      - 'kronos-scanner/backend/research/aapl_quote.py'
       - '.github/workflows/aapl-event.yml'
   workflow_dispatch: {}
 
@@ -25,7 +26,11 @@ jobs:
         working-directory: kronos-scanner/backend/research
         run: |
           set +e
-          python aapl_event.py > /tmp/o.txt 2>&1
+          if [ -f aapl_quote.py ] && git log -1 --name-only --format= | grep -q aapl_quote.py; then
+            python aapl_quote.py > /tmp/o.txt 2>&1
+          else
+            python aapl_event.py > /tmp/o.txt 2>&1
+          fi
           grep -viE 'FutureWarning|DeprecationWarning|warnings\.warn|^\s*$' /tmp/o.txt > /tmp/c.txt || true
           cat /tmp/c.txt
           { echo 'out<<EOF'; cat /tmp/c.txt; echo 'EOF'; } >> "$GITHUB_OUTPUT"
@@ -34,7 +39,7 @@ jobs:
           script: |
             await github.rest.issues.create({
               owner: context.repo.owner, repo: context.repo.repo,
-              title: `AAPL iPhone-launch study — ${new Date().toISOString().slice(0,10)}`,
+              title: `AAPL quote/study — ${new Date().toISOString().slice(0,16).replace('T',' ')}Z`,
               body: ['```', `${{ steps.r.outputs.out }}`.trim(), '```', '',
                      '_Long-only account: "sell the news" cuts against a long. Distances are % of price — place the stop off your live quote._'].join('\n'),
               labels: ['kronos-research'],
