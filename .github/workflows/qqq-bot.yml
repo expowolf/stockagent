@@ -1,0 +1,120 @@
+name: QQQ bot
+# Live VWAP-pullback signals for QQQ/SPY during the regular session.
+# Alerts post as GitHub issues, which email and mobile-push the repo owner,
+# so nothing depends on a Claude session being awake.
+#
+# WHY ONE LONG JOB INSTEAD OF TWENTY-ONE SHORT ONES
+#   workflow_dispatch returns 403 for the token available here, so the only
+#   triggers are cron and push. On the day this was written the schedule fired
+#   ZERO of its ~40 slots, while an older workflow in the same repo had 36
+#   scheduled runs on record — every one of them 15-30 minutes late. GitHub's
+#   scheduler sheds load, and a 10-minute cadence turns that into twenty-one
+#   independent chances to be dropped.
+#
+#   The bot now loops internally for the session and posts each alert itself as
+#   it happens, so the scheduler only has to work ONCE, at the open. The sweep
+#   crons below are a backstop: if the session job never started, they still
+#   catch setups one pass at a time.
+
+# PAUSED at the user's request (2026-08-30): the VWAP-pullback strategy is
+# being replaced. The bot must not alert until a new strategy is defined.
+# Uncomment the schedule to bring it back.
+on:
+  # schedule:
+  #   - cron: '23 13 * * 1-5'
+  #   - cron: '38 13 * * 1-5'
+  #   - cron: '7,27,47 14-19 * * 1-5'
+  workflow_dispatch: {}
+  # Push trigger: the token here cannot dispatch workflows, so this is the
+  # only way to force an on-demand run.
+  push:
+    paths:
+      - 'kronos-scanner/backend/research/qqq_bot.py'
+      - '.github/workflows/qqq-bot.yml'
+      # '.github/kick' is deliberately NOT listed while the bot is paused.
+      # The 08:22 CT routine still fires and still pushes that file; leaving
+      # it wired would restart the very bot this pause is meant to silence.
+
+# A running session job must not be interrupted, and a backstop sweep must not
+# run beside it and double-alert.
+concurrency:
+  group: qqq-bot
+  # A push supersedes a running job; anything else queues behind it.
+  #
+  # This is the only kill switch available: both workflow_dispatch and the
+  # runs/cancel API return 403 for this token, so when a live session job is
+  # misbehaving, a push is the sole way to replace it. Cron backstops must
+  # NOT cancel — a sweep landing mid-morning would otherwise kill the very
+  # session job it exists to back up.
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+env:
+  KRONOS_ACCOUNT_SIZE: '570'
+  KRONOS_RISK_PER_TRADE: '0.005'   # 0.5% base, per the user's own risk spec
+  KRONOS_DAILY_LOSS: '0.02'
+  KRONOS_MAX_CONSEC_LOSSES: '3'
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    # The session job exits at 15:05 ET. Ample headroom, plus a hard ceiling so
+    # a hung fetch cannot burn the whole 6-hour job limit.
+    timeout-minutes: 400
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Check out the BRANCH TIP, not the SHA that triggered this run.
+          #
+          # A push-triggered job otherwise gets the pushed commit, which can
+          # predate the alert ledger a previous job committed seconds earlier.
+          # That is exactly what happened on 2026-08-28: a restart read a
+          # state file from before the running bot had saved its alerts and
+          # re-issued a signal the user had already been notified about.
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install --upgrade yfinance pandas numpy curl_cffi
+
+      # Mode is decided by the CLOCK, not by which trigger fired.
+      #
+      # GitHub's scheduler delivered a probe cron EIGHT HOURS late on this
+      # repo, so cron cannot be the thing that starts the session. Anything
+      # that reaches the runner during market hours should start the session
+      # job instead — a push, a dispatch, a very late cron. Whichever arrives
+      # first wins; concurrency keeps the rest from running beside it.
+      - name: decide mode
+        id: m
+        run: |
+          H=$(date -u +%H); D=$(date -u +%u)
+          if [ "$D" -le 5 ] && [ "$H" -ge 13 ] && [ "$H" -lt 19 ]; then
+            echo "loop=1" >> "$GITHUB_OUTPUT"
+            echo "session job: looping until 15:05 ET"
+          else
+            echo "loop=" >> "$GITHUB_OUTPUT"
+            echo "outside market hours: single pass"
+          fi
+          echo "event=${{ github.event_name }} at $(date -u +%H:%M) UTC"
+
+      - name: scan
+        env:
+          KRONOS_LOOP: ${{ steps.m.outputs.loop }}
+          # The bot posts its own alerts, in real time. A workflow step could
+          # only post once the job ended — hours late on an intraday signal.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: kronos-scanner/backend/research
+        run: python qqq_bot.py
+
+      - name: persist state
+        if: always()
+        run: |
+          git config user.name  "kronos-bot"
+          git config user.email "kronos-bot@users.noreply.github.com"
+          git add data/live/qqq_bot.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "qqq bot: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git pull --rebase -q || true
+          git push || true
